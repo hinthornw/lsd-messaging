@@ -1,0 +1,9 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "echo": "./app/agent.py:graph"
+  },
+  "http": {
+    "app": "./app/bot.py:app"
+  }
+}

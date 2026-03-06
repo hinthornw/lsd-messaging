@@ -1,0 +1,27 @@
+[package]
+name = "lsmsg-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Unified messaging runtime in Rust with PyO3 bindings"
+license = "MIT"
+
+[lib]
+name = "_lsmsg_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dashmap = "6.1.0"
+parking_lot = "0.12.3"
+pyo3 = { version = "0.23.4", features = ["abi3-py39", "auto-initialize"] }
+pythonize = "0.23.0"
+regex = "1.11.1"
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+thiserror = "2.0.11"
+time = { version = "0.3.37", features = ["parsing"] }
+urlencoding = "2.1.3"
+uuid = { version = "1.14.0", features = ["v4", "v5", "fast-rng"] }
+
+[dev-dependencies]
+mockito = "1.7.0"

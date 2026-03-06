@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - run: uv sync
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      - run: uv run ty check src
+      - run: cd lsmsg-rs && cargo fmt --check
+      - run: cd lsmsg-rs && cargo clippy -- -D warnings
+
+  test-python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - run: uv sync
+      - run: uv run pytest tests/ -v --ignore=tests/integration
+
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cd lsmsg-rs && cargo test
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test-python, test-rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: uv build
+      - run: pip install maturin && cd lsmsg-rs && maturin build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: |
+            dist/*.whl
+            lsmsg-rs/target/wheels/*.whl
