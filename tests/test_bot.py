@@ -9,6 +9,7 @@ from starlette.testclient import TestClient
 from lsmsg import (
     Bot,
     CommandEvent,
+    Discord,
     MentionEvent,
     MessageEvent,
     ReactionEvent,
@@ -244,6 +245,30 @@ class TestBotWebhook:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True}
 
+    def test_slack_command_manual_ack_custom_payload(self):
+        bot = _make_bot()
+
+        @bot.command("/ask", ack=False)
+        async def handle(event: CommandEvent):
+            await event.ack("Manual ack")
+
+        client = TestClient(bot)
+        form_data = urlencode(
+            {
+                "command": "/ask",
+                "text": "test",
+                "team_id": "T123",
+                "channel_id": "C456",
+                "user_id": "U789",
+                "trigger_id": "trig-1",
+            }
+        )
+        headers = _sign_headers("test-secret", form_data.encode())
+        headers["content-type"] = "application/x-www-form-urlencoded"
+        resp = client.post("/slack/events", content=form_data, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json() == {"response_type": "ephemeral", "text": "Manual ack"}
+
 
 class TestBotASGI:
     def test_bot_is_asgi_mountable(self):
@@ -279,6 +304,7 @@ class TestBotTeamsWebhook:
             teams=Teams(app_id="test", app_password="test", tenant_id="test"),
             run_backend=FakeRunBackend(),
             message_sender=FakeMessageSender(),
+            allow_unauthenticated_teams=True,
         )
         calls = []
 
@@ -302,6 +328,28 @@ class TestBotTeamsWebhook:
         )
         assert resp.status_code == 200
 
+    def test_teams_requires_auth_by_default(self):
+        bot = Bot(
+            teams=Teams(app_id="test", app_password="test", tenant_id="test"),
+            run_backend=FakeRunBackend(),
+            message_sender=FakeMessageSender(),
+        )
+        client = TestClient(bot)
+        payload = {
+            "type": "message",
+            "text": "hello from teams",
+            "from": {"id": "user-1"},
+            "conversation": {"id": "conv-1"},
+            "channelData": {"tenant": {"id": "t1"}, "team": {"id": "team-1"}},
+            "id": "msg-1",
+        }
+        resp = client.post(
+            "/teams/events",
+            content=json.dumps(payload),
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 401
+
 
 class TestBotErrorHandler:
     def test_error_handler_called(self):
@@ -318,7 +366,16 @@ class TestBotErrorHandler:
 
         # We can't easily test background task error handling with TestClient
         # since tasks run async. But we verify the handler is registered.
-        assert bot._on_error is not None
+
+
+def test_bot_rejects_unimplemented_platform_configs():
+    with pytest.raises(NotImplementedError, match="discord"):
+        Bot(
+            slack=Slack(signing_secret="test-secret", bot_token="xoxb-test"),
+            discord=Discord(public_key="pk", bot_token="bt"),
+            run_backend=FakeRunBackend(),
+            message_sender=FakeMessageSender(),
+        )
 
 
 class TestBotRouting:

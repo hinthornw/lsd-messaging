@@ -22,6 +22,7 @@ def _make_bot(**kw):
     return Bot(
         slack=Slack(signing_secret="test-secret", bot_token="xoxb-test"),
         teams=Teams(app_id="test", app_password="test", tenant_id="test"),
+        allow_unauthenticated_teams=True,
         run_backend=FakeRunBackend(),
         message_sender=FakeMessageSender(),
         **kw,

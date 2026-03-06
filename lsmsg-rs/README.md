@@ -1,18 +1,18 @@
-# chat-rs
+# lsmsg-rs
 
-`chat-rs` is a Rust-first unified chat runtime with native Python bindings built via `pyo3` + `maturin`.
+`lsmsg-rs` is a Rust-first unified chat runtime with native Python bindings built via `pyo3` + `maturin`.
 
 ## What this repo contains
 
 - High-performance core runtime in Rust (`Chat`, `Thread`, `Channel`, `Message`, in-memory adapter/state)
-- Python module exposed as `chat_rs`
+- Python module exposed as `lsmsg_rs`
 - Native wheel build config (manylinux/macOS/Windows ready)
 - API-level tests for all user-facing classes and methods
 
 ## Build and install (local dev)
 
 ```bash
-cd chat-rs
+cd lsmsg-rs
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip maturin pytest
@@ -32,7 +32,7 @@ pytest tests/python/test_api.py tests/python/test_bridge.py tests/python/test_ch
 ## Basic usage
 
 ```python
-from chat_rs import Chat, InMemoryAdapter, Author, Message
+from lsmsg_rs import Chat, InMemoryAdapter, Author, Message
 
 chat = Chat(user_name="bot")
 adapter = InMemoryAdapter(name="slack", user_name="bot", bot_user_id="U_BOT")
@@ -50,7 +50,7 @@ chat.process_message("slack", "slack:C123:T456", message)
 `ChatApp` is the high-level API for the common path: webhook -> typed context -> LangGraph run.
 
 ```python
-from chat_rs import ChatApp
+from lsmsg_rs import ChatApp
 
 chat = ChatApp(
     api_base_url="https://your-langgraph-api",
@@ -59,6 +59,7 @@ chat = ChatApp(
         "planner": "assistant-planner-id",
     },
     slack_signing_secret="...",
+    teams_app_id="...",
 )
 
 # One-line ASGI app with built-in mention + /agent routing
@@ -97,9 +98,9 @@ It supports:
 - frozen, typed route contexts (`SlackRouteCtx | TeamsRouteCtx`)
 
 ```python
-from chat_rs import ChatBridge, SlackAck, SlackRouteCtx, TeamsRouteCtx
+from lsmsg_rs import ChatBridge, SlackAck, SlackRouteCtx, TeamsRouteCtx
 
-bridge = ChatBridge(slack_signing_secret="...")
+bridge = ChatBridge(slack_signing_secret="...", teams_app_id="...")
 
 @bridge.on_mention(provider="slack")
 async def on_slack(ctx: SlackRouteCtx) -> None:
@@ -120,13 +121,19 @@ async def slash_agent(ctx: SlackRouteCtx) -> SlackAck:
 app = bridge.asgi_app()
 ```
 
+Security defaults are fail-closed:
+
+- Slack webhooks require `slack_signing_secret`
+- Teams webhooks require `teams_app_id` + Bot Framework bearer token validation
+- Use `allow_unsigned_slack=True` / `allow_unauthenticated_teams=True` only for local testing
+
 Use an existing Starlette app instead:
 
 ```python
 from starlette.applications import Starlette
 
 app = Starlette()
-bridge = ChatBridge(slack_signing_secret="...")
+bridge = ChatBridge(slack_signing_secret="...", teams_app_id="...")
 
 # Option B: add routes directly (inherits app middleware)
 bridge.register_routes(app, prefix="/chat")
@@ -137,10 +144,10 @@ bridge.register_routes(app, prefix="/chat")
 
 ## Real adapters
 
-`chat-rs` includes HTTP-backed adapters for Slack and Discord:
+`lsmsg-rs` includes HTTP-backed adapters for Slack and Discord:
 
 ```python
-from chat_rs import Chat, SlackAdapter, DiscordAdapter
+from lsmsg_rs import Chat, SlackAdapter, DiscordAdapter
 
 chat = Chat(user_name="bot")
 
@@ -164,7 +171,7 @@ chat.add_adapter(
 For LangGraph run dispatch (thread mapping + run triggering), use `LangGraphAdapter`:
 
 ```python
-from chat_rs import LangGraphAdapter
+from lsmsg_rs import LangGraphAdapter
 
 langgraph = LangGraphAdapter(
     api_base_url="https://your-langgraph-api",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import re
 from types import MappingProxyType
@@ -9,6 +10,8 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol, TypeAlias
 
 from ._lsmsg_rs import LangGraphAdapter
 from .bridge import ChatBridge, Provider, RouteCtx, SlackAck
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _RunAdapter(Protocol):
@@ -75,10 +78,16 @@ class ChatApp:
         api_key: str | None = None,
         thread_namespace: str | None = None,
         slack_signing_secret: str | None = None,
+        allow_unsigned_slack: bool = False,
+        teams_app_id: str | None = None,
+        allow_unauthenticated_teams: bool = False,
+        max_webhook_body_bytes: int = 1_048_576,
+        max_bridge_pending_tasks: int = 1_024,
         background_dispatch: bool = True,
         auto_routes: bool = True,
         default_command: str | None = "/agent",
         include_message_events: bool = False,
+        max_background_tasks: int = 1_024,
         multitask_strategy: str = "enqueue",
         if_not_exists: str = "create",
         webhook: str | None = None,
@@ -95,6 +104,11 @@ class ChatApp:
 
         self.bridge = ChatBridge(
             slack_signing_secret=slack_signing_secret,
+            allow_unsigned_slack=allow_unsigned_slack,
+            teams_app_id=teams_app_id,
+            allow_unauthenticated_teams=allow_unauthenticated_teams,
+            max_body_bytes=max_webhook_body_bytes,
+            max_pending_tasks=max_bridge_pending_tasks,
             background_dispatch=background_dispatch,
         )
         self._assistant_ids = assistant_map
@@ -104,6 +118,9 @@ class ChatApp:
         self._if_not_exists = if_not_exists
         self._webhook = _clean_optional(webhook)
         self._durability = _clean_optional(durability)
+        if max_background_tasks <= 0:
+            raise ValueError("max_background_tasks must be positive")
+        self._max_background_tasks = max_background_tasks
         self._pending_tasks: set[asyncio.Task[Any]] = set()
 
         if adapter_factory is None:
@@ -138,10 +155,16 @@ class ChatApp:
         assistant_id: str | None = None,
         default_assistant: str | None = None,
         slack_signing_secret: str | None = None,
+        allow_unsigned_slack: bool = False,
+        teams_app_id: str | None = None,
+        allow_unauthenticated_teams: bool = False,
+        max_webhook_body_bytes: int = 1_048_576,
+        max_bridge_pending_tasks: int = 1_024,
         background_dispatch: bool = True,
         auto_routes: bool = True,
         default_command: str | None = "/agent",
         include_message_events: bool = False,
+        max_background_tasks: int = 1_024,
         multitask_strategy: str = "enqueue",
         if_not_exists: str = "create",
         webhook: str | None = None,
@@ -158,6 +181,8 @@ class ChatApp:
 
         if slack_signing_secret is None:
             slack_signing_secret = os.getenv("SLACK_SIGNING_SECRET")
+        if teams_app_id is None:
+            teams_app_id = _clean_optional(os.getenv("TEAMS_APP_ID"))
 
         return cls(
             api_base_url=api_base_url,
@@ -167,10 +192,16 @@ class ChatApp:
             api_key=api_key,
             thread_namespace=thread_namespace,
             slack_signing_secret=slack_signing_secret,
+            allow_unsigned_slack=allow_unsigned_slack,
+            teams_app_id=teams_app_id,
+            allow_unauthenticated_teams=allow_unauthenticated_teams,
+            max_webhook_body_bytes=max_webhook_body_bytes,
+            max_bridge_pending_tasks=max_bridge_pending_tasks,
             background_dispatch=background_dispatch,
             auto_routes=auto_routes,
             default_command=default_command,
             include_message_events=include_message_events,
+            max_background_tasks=max_background_tasks,
             multitask_strategy=multitask_strategy,
             if_not_exists=if_not_exists,
             webhook=webhook,
@@ -259,7 +290,13 @@ class ChatApp:
             @self.on_command(default_command)
             async def _on_command(ctx: RouteCtx) -> SlackAck:
                 assistant = await self.resolve_assistant(ctx)
-                self._spawn_background(self.trigger(ctx, assistant=assistant))
+                run_coro = self.trigger(ctx, assistant=assistant)
+                if not self._spawn_background(run_coro):
+                    run_coro.close()
+                    return SlackAck(
+                        text="System busy, please retry shortly.",
+                        response_type="ephemeral",
+                    )
                 return SlackAck(
                     text=f"Running {assistant}...",
                     response_type="ephemeral",
@@ -319,7 +356,8 @@ class ChatApp:
             self._config_builder(ctx, alias)
         )
 
-        result = adapter.trigger_run(
+        result = await asyncio.to_thread(
+            adapter.trigger_run,
             provider=ctx.provider,
             workspace_id=ctx.workspace_id,
             channel_id=ctx.channel_id,
@@ -350,17 +388,20 @@ class ChatApp:
     def _default_selector(self, ctx: RouteCtx) -> str | None:
         return ctx.assistant_hint
 
-    def _spawn_background(self, awaitable: Awaitable[Any]) -> None:
+    def _spawn_background(self, awaitable: Awaitable[Any]) -> bool:
+        if len(self._pending_tasks) >= self._max_background_tasks:
+            return False
         task = asyncio.create_task(awaitable)
         self._pending_tasks.add(task)
         task.add_done_callback(self._on_task_done)
+        return True
 
     def _on_task_done(self, task: asyncio.Task[Any]) -> None:
         self._pending_tasks.discard(task)
         try:
             task.result()
         except Exception:
-            pass
+            _LOGGER.exception("chat app background task failed")
 
 
 def _langgraph_adapter_factory(

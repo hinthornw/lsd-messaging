@@ -25,9 +25,10 @@ async def on_echo(event: CommandEvent) -> None:
 
 @bot.message
 async def on_message(event: MessageEvent) -> None:
+    msg = await event.reply("Thinking...")
     async for chunk in event.stream("echo"):
-        if chunk.text_delta:
-            await event.reply(chunk.text_delta)
+        if chunk.text:
+            await msg.update(chunk.text)
 
 
 app = Starlette()

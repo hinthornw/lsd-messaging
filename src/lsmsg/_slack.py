@@ -35,7 +35,7 @@ def verify_slack_signature(
         return False
     if abs(int(time.time()) - ts_int) > 60 * 5:
         return False
-    base = f"v0:{timestamp}:{body.decode('utf-8')}".encode("utf-8")
+    base = b"v0:" + timestamp.encode("utf-8") + b":" + body
     digest = hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
     expected = f"v0={digest}"
     return hmac.compare_digest(expected, signature)
@@ -57,7 +57,7 @@ def parse_slack_webhook(
 
     try:
         payload = json.loads(body.decode("utf-8") or "{}")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None
 
     if payload.get("type") == "url_verification":
@@ -67,7 +67,10 @@ def parse_slack_webhook(
 
 
 def _parse_form(body: bytes) -> BaseEvent | None:
-    decoded = body.decode("utf-8")
+    try:
+        decoded = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
     form = parse_qs(decoded, keep_blank_values=True)
 
     if "payload" in form:
@@ -210,7 +213,8 @@ def _strip_slack_mentions(text: str) -> str:
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
-    return headers.get(name) or headers.get(name.title()) or headers.get(name.upper())
+    # Starlette headers are case-insensitive; plain .get() suffices.
+    return headers.get(name)
 
 
 def _first(values: list[str] | None, default: str | None) -> str:

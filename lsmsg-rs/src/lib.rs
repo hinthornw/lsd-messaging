@@ -343,6 +343,16 @@ trait Adapter: Send + Sync {
         Ok(())
     }
     fn fetch_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageData>, ChatError>;
+    fn fetch_message_by_id(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageData>, ChatError> {
+        let messages = self.fetch_messages(thread_id, 200)?;
+        Ok(messages
+            .into_iter()
+            .find(|message| message.id == message_id))
+    }
 }
 
 #[derive(Default)]
@@ -523,6 +533,24 @@ impl Adapter for InMemoryAdapter {
             }
         }
         Ok(out)
+    }
+
+    fn fetch_message_by_id(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageData>, ChatError> {
+        let message = self
+            .messages_by_id
+            .get(message_id)
+            .map(|entry| entry.clone());
+        if let Some(message) = message {
+            if message.thread_id == thread_id {
+                return Ok(Some(message));
+            }
+            return Ok(None);
+        }
+        Ok(None)
     }
 }
 
@@ -897,6 +925,49 @@ impl Adapter for SlackAdapter {
         messages.sort_by_key(|message| message.metadata.date_sent_ms);
         Ok(messages)
     }
+
+    fn fetch_message_by_id(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageData>, ChatError> {
+        let (channel_id, thread_ts) = parse_adapter_thread_id("slack", thread_id)?;
+        let response = if let Some(thread_ts) = thread_ts.clone() {
+            self.api_get(
+                "conversations.replies",
+                &[
+                    ("channel", channel_id.clone()),
+                    ("ts", thread_ts),
+                    ("latest", message_id.to_string()),
+                    ("inclusive", "true".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )?
+        } else {
+            self.api_get(
+                "conversations.history",
+                &[
+                    ("channel", channel_id.clone()),
+                    ("latest", message_id.to_string()),
+                    ("inclusive", "true".to_string()),
+                    ("limit", "1".to_string()),
+                ],
+            )?
+        };
+
+        let messages = response
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for value in messages {
+            let parsed = self.parse_message(&channel_id, &value, thread_ts.as_deref());
+            if parsed.id == message_id {
+                return Ok(Some(parsed));
+            }
+        }
+        Ok(None)
+    }
 }
 
 struct DiscordAdapter {
@@ -1201,6 +1272,46 @@ impl Adapter for DiscordAdapter {
 
         messages.sort_by_key(|message| message.metadata.date_sent_ms);
         Ok(messages)
+    }
+
+    fn fetch_message_by_id(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageData>, ChatError> {
+        let (channel_id, root_message_id) = parse_adapter_thread_id("discord", thread_id)?;
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.api_base_url, channel_id, message_id
+        );
+        let response = self
+            .client
+            .request(Method::GET, url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("User-Agent", "lsmsg-rs/0.1")
+            .send()
+            .map_err(|err| ChatError::Http(err.to_string()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        let payload: Value = response
+            .json()
+            .map_err(|err| ChatError::Http(err.to_string()))?;
+        if !status.is_success() {
+            return Err(ChatError::Http(format!(
+                "discord channels/{channel_id}/messages/{message_id} failed with status {}: {}",
+                status, payload
+            )));
+        }
+
+        Ok(Some(self.parse_message(
+            &channel_id,
+            root_message_id.as_deref(),
+            &payload,
+        )))
     }
 }
 
@@ -1770,10 +1881,7 @@ impl PySentMessage {
 
     fn to_message(&self, py: Python<'_>) -> PyResult<Py<PyMessage>> {
         let adapter = self.core.adapter(&self.adapter_name)?;
-        let maybe_message = adapter
-            .fetch_messages(&self.thread_id, usize::MAX)?
-            .into_iter()
-            .find(|message| message.id == self.id);
+        let maybe_message = adapter.fetch_message_by_id(&self.thread_id, &self.id)?;
 
         let message = maybe_message.ok_or_else(|| ChatError::MessageNotFound(self.id.clone()))?;
         Py::new(py, PyMessage { inner: message })
@@ -2453,15 +2561,12 @@ impl PyChat {
             return Ok(());
         }
 
-        let dedupe_key = format!("dedupe:{}:{}", adapter_name, message_data.id);
+        let dedupe_key = format!("dedupe:{}:{}:{}", adapter_name, thread_id, message_data.id);
         if let Some(Value::Bool(already_processed)) = self.core.state.get(&dedupe_key) {
             if already_processed {
                 return Ok(());
             }
         }
-        self.core
-            .state
-            .set(&dedupe_key, Value::Bool(true), Some(self.core.dedupe_ttl));
 
         let lock = self
             .core
@@ -2477,6 +2582,11 @@ impl PyChat {
             &mut message_data,
         );
         self.core.state.release_lock(&lock);
+        if result.is_ok() {
+            self.core
+                .state
+                .set(&dedupe_key, Value::Bool(true), Some(self.core.dedupe_ttl));
+        }
         result
     }
 
@@ -2928,6 +3038,11 @@ mod tests {
         let create_mock = server
             .mock("POST", "/chat.postMessage")
             .match_header("authorization", "Bearer xoxb-test")
+            .match_body(Matcher::Regex(r#""channel":"C1""#.to_string()))
+            .match_body(Matcher::Regex(r#""text":"reply""#.to_string()))
+            .match_body(Matcher::Regex(
+                r#""thread_ts":"1710000000\.100""#.to_string(),
+            ))
             .with_status(200)
             .with_body(r#"{"ok":true,"channel":"C1","ts":"1710000000.200"}"#)
             .create();
@@ -2935,6 +3050,8 @@ mod tests {
         let edit_mock = server
             .mock("POST", "/chat.update")
             .match_header("authorization", "Bearer xoxb-test")
+            .match_body(Matcher::Regex(r#""channel":"C1""#.to_string()))
+            .match_body(Matcher::Regex(r#""ts":"1710000000\.200""#.to_string()))
             .with_status(200)
             .with_body(r#"{"ok":true}"#)
             .create();
@@ -2955,6 +3072,8 @@ mod tests {
         let delete_mock = server
             .mock("POST", "/chat.delete")
             .match_header("authorization", "Bearer xoxb-test")
+            .match_body(Matcher::Regex(r#""channel":"C1""#.to_string()))
+            .match_body(Matcher::Regex(r#""ts":"1710000000\.200""#.to_string()))
             .with_status(200)
             .with_body(r#"{"ok":true}"#)
             .create();
@@ -3009,6 +3128,7 @@ mod tests {
         let create_root_mock = server
             .mock("POST", "/channels/CHAN1/messages")
             .match_header("authorization", "Bot discord-token")
+            .match_body(Matcher::Regex(r#""content":"root""#.to_string()))
             .with_status(200)
             .with_body(
                 r#"{"id":"m1","channel_id":"CHAN1","content":"root","timestamp":"2026-03-04T00:00:00Z","author":{"id":"BOT","username":"bot","bot":true}}"#,
@@ -3018,6 +3138,10 @@ mod tests {
         let create_reply_mock = server
             .mock("POST", "/channels/CHAN1/messages")
             .match_header("authorization", "Bot discord-token")
+            .match_body(Matcher::Regex(
+                r#""message_reference":\{"message_id":"m1"\}"#.to_string(),
+            ))
+            .match_body(Matcher::Regex(r#""content":"reply""#.to_string()))
             .with_status(200)
             .with_body(
                 r#"{"id":"m2","channel_id":"CHAN1","content":"reply","timestamp":"2026-03-04T00:00:01Z","author":{"id":"BOT","username":"bot","bot":true}}"#,
@@ -3026,6 +3150,7 @@ mod tests {
 
         let edit_mock = server
             .mock("PATCH", "/channels/CHAN1/messages/m2")
+            .match_body(Matcher::Regex(r#""content":"reply edited""#.to_string()))
             .with_status(200)
             .with_body(r#"{"id":"m2"}"#)
             .create();
@@ -3216,6 +3341,105 @@ mod tests {
         assert_eq!(result["run"]["run_id"].as_str(), Some("run_123"));
         assert_eq!(result["run"]["assistant_id"].as_str(), Some("assistant-a"));
 
+        thread_mock.assert();
+        run_mock.assert();
+    }
+
+    #[test]
+    fn slack_adapter_surfaces_api_errors() {
+        let mut server = mockito::Server::new();
+        let api_base = server.url();
+        let create_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_header("authorization", "Bearer xoxb-test")
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .create();
+
+        let adapter = SlackAdapter::new(
+            "xoxb-test".to_string(),
+            "bot".to_string(),
+            Some("U_BOT".to_string()),
+            Some(api_base),
+        )
+        .expect("adapter should initialize");
+
+        let result =
+            adapter.post_channel_message("slack:C1", &PostableMessage::Text("hello".to_string()));
+        let err = result.expect_err("expected adapter error");
+        assert!(err.to_string().contains("channel_not_found"));
+        create_mock.assert();
+    }
+
+    #[test]
+    fn discord_adapter_surfaces_http_errors() {
+        let mut server = mockito::Server::new();
+        let api_base = server.url();
+        let create_mock = server
+            .mock("POST", "/channels/CHAN1/messages")
+            .with_status(400)
+            .with_body(r#"{"message":"bad request"}"#)
+            .create();
+
+        let adapter = DiscordAdapter::new(
+            "discord-token".to_string(),
+            "bot".to_string(),
+            Some("BOT".to_string()),
+            Some(api_base),
+        )
+        .expect("adapter should initialize");
+
+        let result = adapter
+            .post_channel_message("discord:CHAN1", &PostableMessage::Text("hello".to_string()));
+        let err = result.expect_err("expected adapter error");
+        assert!(err.to_string().contains("status 400"));
+        create_mock.assert();
+    }
+
+    #[test]
+    fn langgraph_adapter_reports_invalid_json_response() {
+        let mut server = mockito::Server::new();
+        let api_base = server.url();
+        let adapter = LangGraphAdapter::new(
+            api_base,
+            "assistant-a".to_string(),
+            Some("sk-test".to_string()),
+            None,
+        )
+        .expect("adapter should initialize");
+
+        let thread_id = adapter
+            .thread_id_for_external("slack", "T123", "C456", "1710000000.100")
+            .expect("thread mapping should succeed");
+        let thread_mock = server
+            .mock("POST", "/threads")
+            .with_status(200)
+            .with_body(r#"{"thread_id":"ok"}"#)
+            .create();
+        let run_mock = server
+            .mock("POST", format!("/threads/{thread_id}/runs").as_str())
+            .with_status(200)
+            .with_body("{not json")
+            .create();
+
+        let result = adapter.trigger_external_run(
+            "slack",
+            "T123",
+            "C456",
+            "1710000000.100",
+            RunDispatchOptions {
+                input: Some(&json!({"messages": [{"role":"user","content":"hello"}]})),
+                thread_metadata: None,
+                run_metadata: None,
+                config: None,
+                multitask_strategy: "enqueue",
+                if_not_exists: "create",
+                webhook: None,
+                durability: None,
+            },
+        );
+        let err = result.expect_err("expected parse error");
+        assert!(err.to_string().contains("invalid json body"));
         thread_mock.assert();
         run_mock.assert();
     }

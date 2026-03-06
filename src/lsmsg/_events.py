@@ -5,13 +5,31 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Mapping, TYPE_CHECKING
 
 from ._capabilities import PlatformCapabilities
-from ._errors import PlatformNotSupported
+from ._errors import LsmsgError, PlatformNotSupported
 from ._reply import SentMessage
 from ._run import Run, RunChunk, RunResult
 
 if TYPE_CHECKING:
     from ._reply import MessageSender
     from ._run import RunBackend
+
+
+class _Missing:
+    """Sentinel for uninjected backends. Raises on any attribute access."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        raise LsmsgError(
+            f"{self._name} not available. Events must be dispatched through Bot."
+        )
+
+
+_MISSING_BACKEND: Any = _Missing("RunBackend")
+_MISSING_SENDER: Any = _Missing("MessageSender")
 
 
 def _deterministic_thread_id(
@@ -48,8 +66,10 @@ class BaseEvent:
 
     # -- injected by Bot at dispatch time --
 
-    _run_backend: RunBackend = field(repr=False, compare=False, default=None)  # type: ignore[assignment]
-    _sender: MessageSender = field(repr=False, compare=False, default=None)  # type: ignore[assignment]
+    _run_backend: RunBackend = field(
+        repr=False, compare=False, default=_MISSING_BACKEND
+    )
+    _sender: MessageSender = field(repr=False, compare=False, default=_MISSING_SENDER)
 
     # -- Run shortcuts (layer 1) --
 
@@ -168,18 +188,34 @@ class MessageEvent(BaseEvent):
     pass
 
 
+@dataclass(slots=True)
+class _AckState:
+    """Mutable ack state for CommandEvent, avoiding frozen-dataclass mutation."""
+
+    sent: bool = False
+    payload: Mapping[str, Any] | None = None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CommandEvent(BaseEvent):
     command: str = ""
+    _ack_state: _AckState = field(default_factory=_AckState, repr=False, compare=False)
 
-    # ack is handled by the Bot at dispatch time.
-    # The event carries the ack text set by the decorator.
-    _ack_text: str | None = field(default=None, repr=False, compare=False)
-    _ack_sent: bool = field(default=False, repr=False, compare=False)
+    @property
+    def _ack_payload(self) -> Mapping[str, Any] | None:
+        return self._ack_state.payload
 
     async def ack(self, text: str | None = None) -> None:
-        # Manual ack for ack=False commands. Implemented by Bot.
-        pass
+        if self._ack_state.sent:
+            return
+        if text is None:
+            self._ack_state.payload = {"ok": True}
+        else:
+            self._ack_state.payload = {
+                "response_type": "ephemeral",
+                "text": text,
+            }
+        self._ack_state.sent = True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

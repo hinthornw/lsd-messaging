@@ -1,18 +1,17 @@
 # lsmsg
 
-A unified messaging SDK that wires chat platforms to [LangGraph](https://github.com/langchain-ai/langgraph) agents. One bot, many platforms, typed events, zero glue code.
+A unified messaging SDK that wires chat platforms to [LangGraph](https://github.com/langchain-ai/langgraph) agents. Typed events, async handlers, and minimal glue code.
 
 ## Why
 
-Every chat platform has its own webhook format, auth scheme, and quirks. If you're building an AI agent that lives in Slack *and* Teams *and* Discord, you end up writing the same webhook→agent→reply plumbing three times — then maintaining it forever.
+Every chat platform has its own webhook format, auth scheme, and quirks. If you're building an AI agent that lives in Slack and Teams, you end up writing the same webhook→agent→reply plumbing repeatedly — then maintaining it forever.
 
 **lsmsg** absorbs that complexity. You write handlers against typed Python events. The SDK handles webhook parsing, signature verification, platform capability differences, and agent orchestration. Your bot code stays the same whether it's running on one platform or seven.
 
 ```
-Slack ─┐                          ┌─ event.invoke("agent")
-Teams ─┤──▶ Bot (ASGI) ──▶ Event ─┤─ event.stream("agent")
-Discord┤                          ├─ event.reply("done")
-  ...  ─┘                          └─ event.whisper("only you")
+Slack ─┐                       ┌─ event.invoke("agent")
+Teams ─┤──▶ Bot (ASGI) ──▶ Event ┤─ event.stream("agent")
+       └───────────────────────└─ event.reply("done")
 ```
 
 ## Quickstart
@@ -46,15 +45,14 @@ Slack webhooks POST to `/slack/events`, the bot parses them into typed events, c
 
 ## Platforms
 
-Pass platform configs to `Bot()`. Each one reads credentials from environment variables by default:
+Webhook ingestion in `Bot` currently supports Slack and Teams. Pass platform configs to `Bot()`:
 
 ```python
-from lsmsg import Bot, Slack, Teams, Discord
+from lsmsg import Bot, Slack, Teams
 
 bot = Bot(
     slack=Slack(),          # SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN
     teams=Teams(),          # TEAMS_APP_ID, TEAMS_APP_PASSWORD, TEAMS_TENANT_ID
-    discord=Discord(),      # DISCORD_PUBLIC_KEY, DISCORD_BOT_TOKEN
 )
 ```
 
@@ -70,11 +68,8 @@ bot = Bot(
 |----------|-------------|----------|
 | Slack | `Slack()` | `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN` |
 | Teams | `Teams()` | `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD`, `TEAMS_TENANT_ID` |
-| Discord | `Discord()` | `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN` |
-| Telegram | `Telegram()` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` |
-| GitHub | `GitHub()` | `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN` |
-| Linear | `Linear()` | `LINEAR_WEBHOOK_SECRET`, `LINEAR_API_KEY` |
-| Google Chat | `GChat()` | `GCHAT_SERVICE_ACCOUNT_JSON`, `GCHAT_PROJECT_ID` |
+
+Other platform config classes are reserved for future webhook adapters and currently raise `NotImplementedError` when passed to `Bot`.
 
 ## Events and handlers
 
@@ -191,8 +186,12 @@ async def analyze(event: CommandEvent) -> None:
 @bot.command("/status", ack="Checking...")       # custom ack text
 async def status(event: CommandEvent) -> None: ...
 
-@bot.command("/quick", ack=False)                # manual ack (you handle timing)
+@bot.command("/quick", ack=False)                # manual ack (you return the ack payload)
 async def quick(event: CommandEvent) -> None: ...
+
+@bot.command("/quick", ack=False)
+async def quick(event: CommandEvent) -> None:
+    await event.ack("On it")
 ```
 
 ## Platform capabilities

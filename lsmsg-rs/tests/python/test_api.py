@@ -147,6 +147,57 @@ def test_chat_event_routing_and_dedupe(chat_and_adapter) -> None:
     assert calls[-1] == ("subscribed", "slack:C1:T1", "m3")
 
 
+def test_chat_dedupe_is_scoped_by_thread(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    calls = []
+
+    chat.on_new_message(r".*", lambda thread, message: calls.append((thread.id, message.id)))
+
+    chat.process_message("slack", "slack:C1:T1", build_message("dup-1", "hello", "slack:C1:T1"))
+    chat.process_message("slack", "slack:C1:T2", build_message("dup-1", "hello", "slack:C1:T2"))
+
+    assert calls == [("slack:C1:T1", "dup-1"), ("slack:C1:T2", "dup-1")]
+
+
+def test_chat_dedupe_marks_only_after_success(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    calls = []
+    should_fail = {"value": True}
+
+    def handler(_thread, message):  # type: ignore[no-untyped-def]
+        if should_fail["value"]:
+            should_fail["value"] = False
+            raise RuntimeError("boom")
+        calls.append(message.id)
+
+    chat.on_new_message(r".*", handler)
+    message = build_message("recover-1", "retry me")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        chat.process_message("slack", "slack:C1:T1", message)
+
+    chat.process_message("slack", "slack:C1:T1", message)
+    assert calls == ["recover-1"]
+
+
+def test_chat_ignores_self_authored_messages(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    calls = []
+    chat.on_new_message(r".*", lambda _thread, _message: calls.append("called"))
+
+    author = Author(
+        user_id="U_BOT",
+        user_name="bot",
+        full_name="Bot",
+        is_bot=True,
+        is_me=True,
+    )
+    message = Message(id="self-1", thread_id="slack:C1:T1", text="ignore", author=author)
+    chat.process_message("slack", "slack:C1:T1", message)
+
+    assert calls == []
+
+
 def test_chat_process_message_accepts_dict_and_string(chat_and_adapter) -> None:
     chat, _ = chat_and_adapter
     seen = []
@@ -173,6 +224,12 @@ def test_chat_process_message_accepts_dict_and_string(chat_and_adapter) -> None:
     assert "from string" in seen
 
 
+def test_chat_process_message_rejects_invalid_type(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    with pytest.raises(TypeError, match="message must be a Message object, dict, or string"):
+        chat.process_message("slack", "slack:C1:T2", 123)  # type: ignore[arg-type]
+
+
 def test_chat_validates_callbacks(chat_and_adapter) -> None:
     chat, _ = chat_and_adapter
 
@@ -186,10 +243,40 @@ def test_chat_validates_callbacks(chat_and_adapter) -> None:
         chat.on_new_message(".*", 1.23)  # type: ignore[arg-type]
 
 
+def test_set_state_requires_json_serializable(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    thread = chat.thread("slack", "slack:C1:T1")
+
+    class NotSerializable:
+        pass
+
+    with pytest.raises(TypeError, match="JSON-serializable"):
+        thread.set_state({"bad": NotSerializable()})  # type: ignore[call-overload]
+
+
+def test_postable_precedence_markdown_over_raw_and_text(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    thread = chat.thread("slack", "slack:C1:T1")
+    sent = thread.post({"markdown": "md", "raw": "raw", "text": "txt"})
+    assert sent.text == "md"
+
+
 def test_chat_channel_invalid_id(chat_and_adapter) -> None:
     chat, _ = chat_and_adapter
     with pytest.raises(ValueError):
         chat.channel("")
+
+
+def test_chat_rejects_duplicate_adapter_registration(chat_and_adapter) -> None:
+    chat, _ = chat_and_adapter
+    with pytest.raises(RuntimeError, match="already registered"):
+        chat.add_adapter(InMemoryAdapter(name="slack", user_name="bot", bot_user_id="U_BOT"))
+
+
+def test_chat_errors_for_unknown_adapter() -> None:
+    chat = Chat(user_name="bot")
+    with pytest.raises(RuntimeError, match="adapter 'missing' not found"):
+        chat.thread("missing", "missing:C1:T1")
 
 
 def test_chat_accepts_real_adapters() -> None:

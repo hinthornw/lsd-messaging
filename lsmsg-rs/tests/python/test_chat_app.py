@@ -3,6 +3,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
@@ -77,6 +78,7 @@ def test_chat_app_default_routes_trigger_assistant_by_hint() -> None:
         assistants={"default": "assistant-default", "planner": "assistant-planner"},
         default_assistant="default",
         background_dispatch=False,
+        allow_unsigned_slack=True,
         adapter_factory=fake_adapter_factory(created),
     )
     client = TestClient(app.asgi_app())
@@ -118,6 +120,7 @@ def test_chat_app_command_ack_is_fast_and_dispatches_run() -> None:
         api_base_url="http://example.test",
         assistants={"default": "assistant-default", "planner": "assistant-planner"},
         background_dispatch=True,
+        allow_unsigned_slack=True,
         adapter_factory=fake_adapter_factory(created),
     )
     client = TestClient(app.asgi_app())
@@ -145,12 +148,44 @@ def test_chat_app_command_ack_is_fast_and_dispatches_run() -> None:
     assert planner.calls[0]["root_thread_id"] == "trigger-2"
 
 
+def test_chat_app_command_returns_busy_ack_when_queue_full() -> None:
+    created: dict[str, FakeLangGraphAdapter] = {}
+    app = ChatApp(
+        api_base_url="http://example.test",
+        assistant_id="assistant-default",
+        background_dispatch=True,
+        allow_unsigned_slack=True,
+        adapter_factory=fake_adapter_factory(created),
+    )
+    app._spawn_background = lambda _awaitable: False  # type: ignore[method-assign]
+    client = TestClient(app.asgi_app())
+
+    response = client.post(
+        "/slack/events",
+        data={
+            "command": "/agent",
+            "text": "do work",
+            "team_id": "T2",
+            "channel_id": "C2",
+            "user_id": "U2",
+            "trigger_id": "trigger-2",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "text": "System busy, please retry shortly.",
+        "response_type": "ephemeral",
+    }
+
+
 def test_chat_app_progressive_customizers() -> None:
     created: dict[str, FakeLangGraphAdapter] = {}
     app = ChatApp(
         api_base_url="http://example.test",
         assistants={"default": "assistant-default", "reviewer": "assistant-reviewer"},
         auto_routes=False,
+        allow_unsigned_slack=True,
         adapter_factory=fake_adapter_factory(created),
     )
 
@@ -199,6 +234,7 @@ def test_chat_app_can_register_into_existing_starlette() -> None:
         api_base_url="http://example.test",
         assistant_id="assistant-default",
         background_dispatch=False,
+        allow_unauthenticated_teams=True,
         adapter_factory=fake_adapter_factory(created),
     )
     starlette_app = Starlette()
@@ -220,3 +256,20 @@ def test_chat_app_can_register_into_existing_starlette() -> None:
 
     assert response.status_code == 200
     assert created["assistant-default"].calls[0]["provider"] == "teams"
+
+
+def test_chat_app_from_env_requires_api_url(monkeypatch) -> None:
+    monkeypatch.delenv("LANGGRAPH_API_URL", raising=False)
+    with pytest.raises(ValueError, match="LANGGRAPH_API_URL"):
+        ChatApp.from_env(assistant_id="assistant-default")
+
+
+def test_chat_app_validates_default_assistant() -> None:
+    with pytest.raises(ValueError, match="default_assistant"):
+        ChatApp(
+            api_base_url="http://example.test",
+            assistants={"planner": "assistant-planner"},
+            default_assistant="missing",
+            allow_unsigned_slack=True,
+            adapter_factory=fake_adapter_factory({}),
+        )

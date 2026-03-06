@@ -16,7 +16,7 @@ def _slack_signature(secret: str, body: bytes, timestamp: int) -> str:
 
 
 def test_asgi_app_dispatches_slack_mention_ctx() -> None:
-    bridge = ChatBridge(background_dispatch=False)
+    bridge = ChatBridge(background_dispatch=False, allow_unsigned_slack=True)
     seen: list[SlackRouteCtx] = []
 
     @bridge.on_mention(provider="slack")
@@ -57,7 +57,7 @@ def test_asgi_app_dispatches_slack_mention_ctx() -> None:
 
 
 def test_on_command_matches_slash_command() -> None:
-    bridge = ChatBridge(background_dispatch=False)
+    bridge = ChatBridge(background_dispatch=False, allow_unsigned_slack=True)
     seen: list[SlackRouteCtx] = []
 
     @bridge.on_command("/agent")
@@ -88,7 +88,7 @@ def test_on_command_matches_slash_command() -> None:
 
 
 def test_on_command_can_return_custom_slack_ack_payload() -> None:
-    bridge = ChatBridge(background_dispatch=True)
+    bridge = ChatBridge(background_dispatch=True, allow_unsigned_slack=True)
 
     @bridge.on_command("/agent")
     async def handler(_ctx):  # type: ignore[no-untyped-def]
@@ -160,9 +160,22 @@ def test_slack_signature_verification() -> None:
     assert bad_response.status_code == 401
     assert seen == ["1710000000.100"]
 
+    stale_timestamp = timestamp - 600
+    stale_signature = _slack_signature(secret, body, stale_timestamp)
+    stale_response = client.post(
+        "/slack/events",
+        content=body,
+        headers={
+            "content-type": "application/json",
+            "x-slack-request-timestamp": str(stale_timestamp),
+            "x-slack-signature": stale_signature,
+        },
+    )
+    assert stale_response.status_code == 401
+
 
 def test_register_routes_on_existing_starlette_app_with_teams() -> None:
-    bridge = ChatBridge(background_dispatch=False)
+    bridge = ChatBridge(background_dispatch=False, allow_unauthenticated_teams=True)
     seen: list[TeamsRouteCtx] = []
 
     @bridge.on_mention(provider="teams")
@@ -201,7 +214,7 @@ def test_register_routes_on_existing_starlette_app_with_teams() -> None:
 
 
 def test_mount_uses_bridge_sub_app() -> None:
-    bridge = ChatBridge(background_dispatch=False)
+    bridge = ChatBridge(background_dispatch=False, allow_unsigned_slack=True)
     seen: list[str] = []
 
     @bridge.on_message(provider="slack")
@@ -227,3 +240,69 @@ def test_mount_uses_bridge_sub_app() -> None:
 
     assert response.status_code == 200
     assert seen == ["1710000000.200"]
+
+
+def test_slack_requires_signing_secret_by_default() -> None:
+    bridge = ChatBridge(background_dispatch=False)
+    client = TestClient(bridge.asgi_app())
+    payload = {
+        "type": "event_callback",
+        "team_id": "T1",
+        "event": {"type": "message", "channel": "C1", "user": "U1", "ts": "1", "text": "x"},
+    }
+    response = client.post("/slack/events", json=payload)
+    assert response.status_code == 503
+
+
+def test_teams_requires_auth_by_default() -> None:
+    bridge = ChatBridge(background_dispatch=False)
+    client = TestClient(bridge.asgi_app())
+    payload = {
+        "type": "message",
+        "id": "m1",
+        "text": "hello",
+        "from": {"id": "user-1"},
+        "conversation": {"id": "conv-1"},
+    }
+    response = client.post("/teams/events", json=payload)
+    assert response.status_code == 503
+
+
+def test_teams_with_app_id_requires_bearer_token() -> None:
+    bridge = ChatBridge(background_dispatch=False, teams_app_id="app-123")
+    client = TestClient(bridge.asgi_app())
+    payload = {
+        "type": "message",
+        "id": "m1",
+        "text": "hello",
+        "from": {"id": "user-1"},
+        "conversation": {"id": "conv-1"},
+    }
+    response = client.post("/teams/events", json=payload)
+    assert response.status_code == 401
+
+
+def test_payload_too_large_returns_413() -> None:
+    bridge = ChatBridge(
+        background_dispatch=False,
+        allow_unsigned_slack=True,
+        max_body_bytes=16,
+    )
+    client = TestClient(bridge.asgi_app())
+    response = client.post(
+        "/slack/events",
+        content=b'{"type":"event_callback","event":{"type":"message"}}',
+        headers={"content-type": "application/json", "content-length": "1024"},
+    )
+    assert response.status_code == 413
+
+
+def test_invalid_utf8_form_returns_400() -> None:
+    bridge = ChatBridge(background_dispatch=False, allow_unsigned_slack=True)
+    client = TestClient(bridge.asgi_app())
+    response = client.post(
+        "/slack/events",
+        content=b"\xff\xfe\xfd",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 400

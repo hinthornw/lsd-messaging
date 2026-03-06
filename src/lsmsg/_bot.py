@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 from dataclasses import dataclass, replace
 from typing import (
     Any,
     Awaitable,
     Callable,
+    Mapping,
     TypeAlias,
 )
 
@@ -35,6 +37,7 @@ from ._teams import parse_teams_webhook
 
 EventHandler: TypeAlias = Callable[..., Awaitable[Any]]
 ErrorHandler: TypeAlias = Callable[[BaseEvent, Exception], Awaitable[None]]
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -62,14 +65,32 @@ class Bot:
         run_backend: RunBackend | None = None,
         message_sender: MessageSender | None = None,
         on_error: ErrorHandler | None = None,
+        max_pending_tasks: int = 1_024,
+        max_body_bytes: int = 1_048_576,
+        allow_unauthenticated_teams: bool = False,
     ) -> None:
+        unsupported: list[str] = []
+        if discord is not None:
+            unsupported.append("discord")
+        if telegram is not None:
+            unsupported.append("telegram")
+        if github is not None:
+            unsupported.append("github")
+        if linear is not None:
+            unsupported.append("linear")
+        if gchat is not None:
+            unsupported.append("gchat")
+        if unsupported:
+            joined = ", ".join(sorted(unsupported))
+            raise NotImplementedError(
+                f"Bot currently supports only Slack and Teams webhooks. Unsupported configs: {joined}"
+            )
+        if max_pending_tasks <= 0:
+            raise ValueError("max_pending_tasks must be positive")
+        if max_body_bytes <= 0:
+            raise ValueError("max_body_bytes must be positive")
         self._slack = slack
         self._teams = teams
-        self._discord = discord
-        self._telegram = telegram
-        self._github = github
-        self._linear = linear
-        self._gchat = gchat
         if run_backend is None:
             from ._langgraph_backend import LangGraphRunBackend
 
@@ -80,6 +101,12 @@ class Bot:
         self._handlers: list[_HandlerRegistration] = []
         self._command_ack: dict[str, str | bool] = {}
         self._pending_tasks: set[asyncio.Task[Any]] = set()
+        self._max_pending_tasks = max_pending_tasks
+        self._max_body_bytes = max_body_bytes
+        self._teams_validator = (
+            _TeamsTokenValidator(teams.app_id) if teams is not None else None
+        )
+        self._allow_unauthenticated_teams = allow_unauthenticated_teams
         self._app: Starlette | None = None
 
     # -- Decorators --
@@ -191,7 +218,11 @@ class Bot:
     # -- Webhook Handlers --
 
     async def _slack_webhook(self, request: Request) -> Response:
+        if _is_content_length_too_large(request.headers, self._max_body_bytes):
+            return PlainTextResponse("payload too large", status_code=413)
         body = await request.body()
+        if len(body) > self._max_body_bytes:
+            return PlainTextResponse("payload too large", status_code=413)
 
         if self._slack is not None and self._slack.signing_secret:
             if not verify_slack_signature(
@@ -214,13 +245,32 @@ class Bot:
         if isinstance(event, CommandEvent):
             return await self._handle_command_event(event)
 
-        self._spawn(self._dispatch(event))
+        if not self._spawn(self._dispatch(event)):
+            return JSONResponse(
+                {"ok": False, "error": "too_many_pending_events"}, status_code=429
+            )
         return JSONResponse({"ok": True})
 
     async def _teams_webhook(self, request: Request) -> Response:
+        if not self._allow_unauthenticated_teams:
+            if self._teams_validator is None:
+                return PlainTextResponse("teams auth not configured", status_code=503)
+            try:
+                valid_auth = self._teams_validator.validate_authorization(
+                    request.headers.get("authorization")
+                )
+            except RuntimeError as exc:
+                return PlainTextResponse(str(exc), status_code=500)
+            if not valid_auth:
+                return PlainTextResponse("invalid teams authorization", status_code=401)
+        if _is_content_length_too_large(request.headers, self._max_body_bytes):
+            return PlainTextResponse("payload too large", status_code=413)
+        body = await request.body()
+        if len(body) > self._max_body_bytes:
+            return PlainTextResponse("payload too large", status_code=413)
         try:
-            payload = await request.json()
-        except json.JSONDecodeError:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return PlainTextResponse("invalid json", status_code=400)
 
         event = parse_teams_webhook(payload)
@@ -228,7 +278,10 @@ class Bot:
             return JSONResponse({"ok": True})
 
         event = self._inject_backends(event)
-        self._spawn(self._dispatch(event))
+        if not self._spawn(self._dispatch(event)):
+            return JSONResponse(
+                {"ok": False, "error": "too_many_pending_events"}, status_code=429
+            )
         return JSONResponse({"ok": True})
 
     # -- Dispatch --
@@ -242,12 +295,20 @@ class Bot:
                 continue
 
             if ack_config is False:
-                # Manual ack mode — run inline, return empty ack
-                self._spawn(self._safe_call(reg.handler, event))
+                # Manual ack mode — run inline and return event.ack(...) payload if provided.
+                await self._safe_call(reg.handler, event)
+                if event._ack_payload is not None:
+                    return JSONResponse(dict(event._ack_payload))
                 return JSONResponse({"ok": True})
 
             # Auto-ack: spawn handler in background, return ack response
-            self._spawn(self._safe_call(reg.handler, event))
+            if not self._spawn(self._safe_call(reg.handler, event)):
+                return JSONResponse(
+                    {
+                        "response_type": "ephemeral",
+                        "text": "System busy, please retry shortly.",
+                    }
+                )
 
             if isinstance(ack_config, str):
                 return JSONResponse(
@@ -322,10 +383,22 @@ class Bot:
             _sender=self._message_sender,
         )
 
-    def _spawn(self, coro: Any) -> None:
+    def _spawn(self, coro: Any) -> bool:
+        if len(self._pending_tasks) >= self._max_pending_tasks:
+            if hasattr(coro, "close"):
+                coro.close()
+            return False
         task = asyncio.create_task(coro)
         self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+        task.add_done_callback(self._on_task_done)
+        return True
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._pending_tasks.discard(task)
+        try:
+            task.result()
+        except Exception:
+            _LOGGER.exception("bot background task failed")
 
 
 class _Decorator:
@@ -381,6 +454,69 @@ def _normalize_prefix(value: str) -> str:
     if not trimmed.startswith("/"):
         trimmed = f"/{trimmed}"
     return trimmed.rstrip("/")
+
+
+def _is_content_length_too_large(
+    headers: Mapping[str, str], max_body_bytes: int
+) -> bool:
+    length = headers.get("content-length")
+    if length is None:
+        return False
+    try:
+        value = int(length)
+    except ValueError:
+        return True
+    return value > max_body_bytes
+
+
+class _TeamsTokenValidator:
+    _BOT_FRAMEWORK_JWKS_URL = "https://login.botframework.com/v1/.well-known/keys"
+    _BOT_FRAMEWORK_ISSUER = "https://api.botframework.com"
+
+    def __init__(self, app_id: str) -> None:
+        self._app_id = app_id.strip()
+        if not self._app_id:
+            raise ValueError("teams app_id must be non-empty")
+        self._jwks_client: Any | None = None
+
+    def validate_authorization(self, authorization: str | None) -> bool:
+        if not authorization:
+            return False
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return False
+
+        try:
+            from jwt import PyJWKClient, decode
+            from jwt.exceptions import InvalidTokenError
+        except ImportError:
+            raise RuntimeError(
+                "Teams auth requires pyjwt[crypto]. Install dependency 'pyjwt[crypto]>=2.10'."
+            )
+
+        if self._jwks_client is None:
+            self._jwks_client = PyJWKClient(self._BOT_FRAMEWORK_JWKS_URL)
+
+        try:
+            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            payload = decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=[self._app_id, f"api://{self._app_id}"],
+                issuer=self._BOT_FRAMEWORK_ISSUER,
+                options={"require": ["exp", "iat", "nbf", "iss", "aud"]},
+            )
+        except InvalidTokenError:
+            return False
+
+        service_url = payload.get("serviceurl")
+        if service_url is not None and (
+            not isinstance(service_url, str)
+            or not service_url.lower().startswith("https://")
+        ):
+            return False
+        return True
 
 
 class _NoopMessageSender:

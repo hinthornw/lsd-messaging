@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from urllib.parse import parse_qs
 
 Provider: TypeAlias = Literal["slack", "teams"]
 EventType: TypeAlias = Literal["mention", "message", "command", "unknown"]
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +107,23 @@ class ChatBridge:
         self,
         *,
         slack_signing_secret: str | None = None,
+        allow_unsigned_slack: bool = False,
+        teams_app_id: str | None = None,
+        allow_unauthenticated_teams: bool = False,
+        max_body_bytes: int = 1_048_576,
+        max_pending_tasks: int = 1_024,
         background_dispatch: bool = True,
     ) -> None:
         self._slack_signing_secret = _clean_optional(slack_signing_secret)
+        self._allow_unsigned_slack = allow_unsigned_slack
+        self._teams_validator = _TeamsTokenValidator(teams_app_id) if _clean_optional(teams_app_id) else None
+        self._allow_unauthenticated_teams = allow_unauthenticated_teams
+        if max_body_bytes <= 0:
+            raise ValueError("max_body_bytes must be positive")
+        if max_pending_tasks <= 0:
+            raise ValueError("max_pending_tasks must be positive")
+        self._max_body_bytes = max_body_bytes
+        self._max_pending_tasks = max_pending_tasks
         self._background_dispatch = background_dispatch
         self._routes: list[_RouteRegistration] = []
         self._pending_tasks: set[asyncio.Task[Any]] = set()
@@ -183,8 +199,17 @@ class ChatBridge:
     async def slack_webhook(self, request: Any):
         JSONResponse, PlainTextResponse = _response_imports()
 
+        if _is_content_length_too_large(request.headers, self._max_body_bytes):
+            return PlainTextResponse("payload too large", status_code=413)
+
         body = await request.body()
-        if self._slack_signing_secret is not None:
+        if len(body) > self._max_body_bytes:
+            return PlainTextResponse("payload too large", status_code=413)
+
+        if self._slack_signing_secret is None:
+            if not self._allow_unsigned_slack:
+                return PlainTextResponse("slack signing secret is required", status_code=503)
+        else:
             if not _verify_slack_signature(
                 signing_secret=self._slack_signing_secret,
                 headers=request.headers,
@@ -194,7 +219,10 @@ class ChatBridge:
 
         content_type = (request.headers.get("content-type") or "").lower()
         if content_type.startswith("application/x-www-form-urlencoded"):
-            ctx = _parse_slack_form(body=body, headers=request.headers)
+            try:
+                ctx = _parse_slack_form(body=body, headers=request.headers)
+            except UnicodeDecodeError:
+                return PlainTextResponse("invalid encoding", status_code=400)
             if ctx is None:
                 return JSONResponse({"ok": True})
             return await self._dispatch_webhook(ctx)
@@ -202,7 +230,7 @@ class ChatBridge:
         payload: dict[str, Any]
         try:
             payload = json.loads(body.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return PlainTextResponse("invalid json", status_code=400)
 
         if payload.get("type") == "url_verification":
@@ -217,9 +245,28 @@ class ChatBridge:
     async def teams_webhook(self, request: Any):
         JSONResponse, PlainTextResponse = _response_imports()
 
+        if self._teams_validator is None:
+            if not self._allow_unauthenticated_teams:
+                return PlainTextResponse("teams app id is required", status_code=503)
+        else:
+            authz = request.headers.get("authorization")
+            try:
+                valid = self._teams_validator.validate_authorization(authz)
+            except RuntimeError as exc:
+                return PlainTextResponse(str(exc), status_code=500)
+            if not valid:
+                return PlainTextResponse("invalid teams authorization", status_code=401)
+
+        if _is_content_length_too_large(request.headers, self._max_body_bytes):
+            return PlainTextResponse("payload too large", status_code=413)
+
+        body = await request.body()
+        if len(body) > self._max_body_bytes:
+            return PlainTextResponse("payload too large", status_code=413)
+
         try:
-            payload = await request.json()
-        except json.JSONDecodeError:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return PlainTextResponse("invalid json", status_code=400)
 
         ctx = _parse_teams_event(payload=payload, headers=request.headers)
@@ -256,6 +303,8 @@ class ChatBridge:
         # a custom Slack ack payload.
         inline_dispatch = isinstance(ctx, SlackRouteCtx) and ctx.event_type == "command"
         if self._background_dispatch and not inline_dispatch:
+            if len(self._pending_tasks) >= self._max_pending_tasks:
+                return JSONResponse({"ok": False, "error": "too_many_pending_events"}, status_code=429)
             task = asyncio.create_task(self._dispatch_internal(ctx))
             self._pending_tasks.add(task)
             task.add_done_callback(self._on_task_done)
@@ -271,9 +320,57 @@ class ChatBridge:
         try:
             task.result()
         except Exception:
-            # The task has already failed asynchronously; keep webhook responses fast.
-            # Users can register middleware/logging around handlers for richer reporting.
-            pass
+            _LOGGER.exception("chat bridge background dispatch failed")
+
+
+class _TeamsTokenValidator:
+    _BOT_FRAMEWORK_JWKS_URL = "https://login.botframework.com/v1/.well-known/keys"
+    _BOT_FRAMEWORK_ISSUER = "https://api.botframework.com"
+
+    def __init__(self, app_id: str) -> None:
+        self._app_id = app_id.strip()
+        if not self._app_id:
+            raise ValueError("teams_app_id must be non-empty")
+        self._jwks_client: Any | None = None
+
+    def validate_authorization(self, authorization: str | None) -> bool:
+        if not authorization:
+            return False
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return False
+        token = token.strip()
+
+        try:
+            from jwt import PyJWKClient, decode
+            from jwt.exceptions import InvalidTokenError
+        except ImportError as exc:
+            raise RuntimeError(
+                "Teams auth requires pyjwt[crypto]. Install dependency 'pyjwt[crypto]>=2.10'."
+            ) from exc
+
+        if self._jwks_client is None:
+            self._jwks_client = PyJWKClient(self._BOT_FRAMEWORK_JWKS_URL)
+
+        try:
+            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            payload = decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=[self._app_id, f"api://{self._app_id}"],
+                issuer=self._BOT_FRAMEWORK_ISSUER,
+                options={"require": ["exp", "iat", "nbf", "iss", "aud"]},
+            )
+        except InvalidTokenError:
+            return False
+
+        service_url = payload.get("serviceurl")
+        if service_url is not None and (
+            not isinstance(service_url, str) or not service_url.lower().startswith("https://")
+        ):
+            return False
+        return True
 
 
 def _starlette_imports():
@@ -321,6 +418,17 @@ def _headers_map(headers: Mapping[str, str]) -> Mapping[str, str]:
 
 def _proxy_json(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(payload))
+
+
+def _is_content_length_too_large(headers: Mapping[str, str], max_body_bytes: int) -> bool:
+    length = headers.get("content-length") or headers.get("Content-Length")
+    if length is None:
+        return False
+    try:
+        value = int(length)
+    except ValueError:
+        return True
+    return value > max_body_bytes
 
 
 def _parse_slack_form(body: bytes, headers: Mapping[str, str]) -> SlackRouteCtx | None:
@@ -516,7 +624,7 @@ def _verify_slack_signature(
     if abs(int(time.time()) - ts_int) > 60 * 5:
         return False
 
-    base = f"v0:{timestamp}:{body.decode('utf-8')}".encode("utf-8")
+    base = b"v0:" + timestamp.encode("utf-8") + b":" + body
     digest = hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
     expected = f"v0={digest}"
     return hmac.compare_digest(expected, signature)
