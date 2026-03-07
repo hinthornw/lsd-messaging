@@ -15,12 +15,15 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 /// Free a string returned by any lsmsg_* function.
+///
+/// # Safety
+///
+/// `s` must be a pointer previously returned by an `lsmsg_*` function in this
+/// library and must not have been freed already.
 #[no_mangle]
-pub extern "C" fn lsmsg_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn lsmsg_free_string(s: *mut c_char) {
     if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
-        }
+        drop(unsafe { CString::from_raw(s) });
     }
 }
 
@@ -40,8 +43,14 @@ fn from_c_str(s: *const c_char) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Verify a Slack request signature. Returns 1 for valid, 0 for invalid.
+///
+/// # Safety
+///
+/// `signing_secret`, `timestamp`, and `signature` must be valid NUL-terminated
+/// strings when non-null. `body` must point to `body_len` readable bytes when
+/// non-null.
 #[no_mangle]
-pub extern "C" fn lsmsg_slack_verify_signature(
+pub unsafe extern "C" fn lsmsg_slack_verify_signature(
     signing_secret: *const c_char,
     timestamp: *const c_char,
     signature: *const c_char,
@@ -73,8 +82,13 @@ pub extern "C" fn lsmsg_slack_verify_signature(
 
 /// Parse a Slack webhook. Returns a JSON string (caller must free).
 /// The JSON has { "type": "event"|"challenge"|"ignored", ... }.
+///
+/// # Safety
+///
+/// `content_type` must be a valid NUL-terminated string when non-null. `body`
+/// must point to `body_len` readable bytes when non-null.
 #[no_mangle]
-pub extern "C" fn lsmsg_slack_parse_webhook(
+pub unsafe extern "C" fn lsmsg_slack_parse_webhook(
     body: *const u8,
     body_len: usize,
     content_type: *const c_char,
@@ -302,7 +316,7 @@ pub extern "C" fn lsmsg_langgraph_free(handle: i64) {
     }
 }
 
-/// Create a run. params_json has { agent, thread_id, input?, config?, metadata? }.
+/// Create a run. params_json has { agent|assistant_id, thread_id, input?, config?, metadata? }.
 /// Returns run_id string or error JSON. Caller must free.
 #[no_mangle]
 pub extern "C" fn lsmsg_langgraph_create_run(
@@ -321,6 +335,7 @@ pub extern "C" fn lsmsg_langgraph_create_run(
     let create_params = lsmsg_core::CreateRunParams {
         agent: params
             .get("agent")
+            .or_else(|| params.get("assistant_id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),

@@ -96,6 +96,7 @@ function mockRequest(overrides: Record<string, any> = {}): any {
       ...overrides.headers,
     },
     body: overrides.body ?? JSON.stringify({ event: {} }),
+    rawBody: overrides.rawBody,
     on: vi.fn(),
   };
 }
@@ -150,6 +151,14 @@ describe('Bot', () => {
     it('creates a bot with minimal config', () => {
       const bot = new Bot({});
       expect(bot).toBeDefined();
+    });
+
+    it('fails with an actionable error when native bindings are unavailable', () => {
+      setNativeModule(undefined);
+      expect(() => new Bot(makeConfig())).toThrow(
+        'lsmsg native bindings are unavailable',
+      );
+      setNativeModule(mockNative);
     });
   });
 
@@ -222,11 +231,19 @@ describe('Bot', () => {
       );
     });
 
-    it('registers via on() for arbitrary event kind', () => {
+    it('registers via on() for broad event kinds', () => {
       const handler = vi.fn();
       bot.on('raw', handler);
       expect(mockRegistry.register).toHaveBeenCalledWith(
         'raw', null, null, null, null, null,
+      );
+    });
+
+    it('registers raw event types via on()', () => {
+      const handler = vi.fn();
+      bot.on('app_home_opened', handler);
+      expect(mockRegistry.register).toHaveBeenCalledWith(
+        'raw', null, null, null, null, 'app_home_opened',
       );
     });
 
@@ -612,12 +629,28 @@ describe('Bot', () => {
       const bot = new Bot(makeConfig());
       mockRegistry.matchEvent.mockReturnValue([]);
 
-      const req = mockRequest({ body: { event: {} } });
+      const req = mockRequest({
+        body: { event: {} },
+        rawBody: Buffer.from('{"event":{}}'),
+      });
       const res = mockResponse();
 
       await bot.handleSlackWebhook(req, res);
 
       expect(res.statusCode).toBe(200);
+    });
+
+    it('rejects object request body without raw bytes when verifying signatures', async () => {
+      const bot = new Bot(makeConfig());
+      const req = mockRequest({ body: { event: {} } });
+      const res = mockResponse();
+
+      await bot.handleSlackWebhook(req, res);
+
+      expect(res.statusCode).toBe(400);
+      expect(res.body).toEqual({
+        error: 'Slack signature verification requires the original raw request body. Use bot.expressMiddleware() or provide req.rawBody.',
+      });
     });
   });
 });

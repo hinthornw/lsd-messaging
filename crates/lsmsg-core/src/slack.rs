@@ -13,7 +13,7 @@ use crate::platform;
 /// Result of parsing a Slack webhook payload.
 pub enum SlackWebhookResult {
     /// A normalized event ready for dispatch.
-    Event(Event),
+    Event(Box<Event>),
     /// A url_verification challenge response.
     Challenge(String),
     /// The payload should be ignored (bot messages, unknown types, etc.).
@@ -128,7 +128,7 @@ fn parse_form(body: &[u8]) -> SlackWebhookResult {
     let user_id = form.get("user_id").cloned().unwrap_or("unknown".into());
     let user_name = form.get("user_name").cloned();
 
-    SlackWebhookResult::Event(Event {
+    SlackWebhookResult::Event(Box::new(Event {
         kind: EventKind::Command,
         platform: platform::slack(),
         workspace_id,
@@ -145,7 +145,7 @@ fn parse_form(body: &[u8]) -> SlackWebhookResult {
         emoji: None,
         raw_event_type: None,
         raw: form_to_value(&form),
-    })
+    }))
 }
 
 fn parse_interaction(payload: &Value) -> SlackWebhookResult {
@@ -181,7 +181,7 @@ fn parse_interaction(payload: &Value) -> SlackWebhookResult {
         .map(|s| s.to_string())
         .unwrap_or_else(|| root_id.clone());
 
-    SlackWebhookResult::Event(Event {
+    SlackWebhookResult::Event(Box::new(Event {
         kind: EventKind::Message,
         platform: platform::slack(),
         workspace_id: str_field_from_obj(team, "id", "unknown"),
@@ -201,7 +201,7 @@ fn parse_interaction(payload: &Value) -> SlackWebhookResult {
         emoji: None,
         raw_event_type: None,
         raw: payload.clone(),
-    })
+    }))
 }
 
 fn parse_event_callback(payload: &Value) -> SlackWebhookResult {
@@ -263,7 +263,7 @@ fn parse_event_callback(payload: &Value) -> SlackWebhookResult {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        return SlackWebhookResult::Event(Event {
+        return SlackWebhookResult::Event(Box::new(Event {
             kind: EventKind::Reaction,
             platform: platform::slack(),
             workspace_id,
@@ -280,7 +280,7 @@ fn parse_event_callback(payload: &Value) -> SlackWebhookResult {
             emoji: Some(emoji),
             raw_event_type: None,
             raw: payload.clone(),
-        });
+        }));
     }
 
     let kind = if is_mention {
@@ -289,7 +289,7 @@ fn parse_event_callback(payload: &Value) -> SlackWebhookResult {
         EventKind::Message
     };
 
-    SlackWebhookResult::Event(Event {
+    SlackWebhookResult::Event(Box::new(Event {
         kind,
         platform: platform::slack(),
         workspace_id,
@@ -306,7 +306,7 @@ fn parse_event_callback(payload: &Value) -> SlackWebhookResult {
         emoji: None,
         raw_event_type: None,
         raw: payload.clone(),
-    })
+    }))
 }
 
 /// Strip Slack-style `<@UXXXX>` mentions from text.

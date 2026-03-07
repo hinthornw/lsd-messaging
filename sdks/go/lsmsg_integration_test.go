@@ -50,3 +50,35 @@ func TestFFITeamsStripMentions(t *testing.T) {
 		t.Error("expected mentions to be stripped")
 	}
 }
+
+func TestFFITeamsParseWebhook(t *testing.T) {
+	event, err := TeamsParseWebhook(map[string]any{
+		"type": "message",
+		"text": "hello teams",
+		"from": map[string]any{
+			"id":   "U1",
+			"name": "Alice",
+		},
+		"conversation": map[string]any{
+			"id":       "conv-1",
+			"tenantId": "tenant-1",
+		},
+		"channelData": map[string]any{
+			"tenant": map[string]any{"id": "tenant-1"},
+			"team":   map[string]any{"id": "team-1"},
+		},
+		"id": "msg-1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if event == nil {
+		t.Fatal("expected event")
+	}
+	if event.Kind != EventMessage {
+		t.Fatalf("expected message event, got %s", event.Kind)
+	}
+	if event.Text != "hello teams" {
+		t.Fatalf("expected text to round-trip, got %q", event.Text)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -91,24 +92,31 @@ func (cgoBackend) TeamsParseWebhook(payloadJSON []byte) (*Event, error) {
 		return nil, nil
 	}
 	jsonStr := goStringFree(result)
+	if strings.TrimSpace(jsonStr) == "null" {
+		return nil, nil
+	}
 
 	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(jsonStr), &envelope); err != nil {
-		return nil, fmt.Errorf("lsmsg: failed to parse teams webhook result: %w", err)
-	}
-	if raw, ok := envelope["error"]; ok {
-		var msg string
-		json.Unmarshal(raw, &msg)
-		return nil, errors.New(msg)
-	}
-	if raw, ok := envelope["event"]; ok {
-		var ev Event
-		if err := json.Unmarshal(raw, &ev); err != nil {
-			return nil, fmt.Errorf("lsmsg: failed to parse event: %w", err)
+	if err := json.Unmarshal([]byte(jsonStr), &envelope); err == nil {
+		if raw, ok := envelope["error"]; ok {
+			var msg string
+			json.Unmarshal(raw, &msg)
+			return nil, errors.New(msg)
 		}
-		return &ev, nil
+		if raw, ok := envelope["event"]; ok {
+			var ev Event
+			if err := json.Unmarshal(raw, &ev); err != nil {
+				return nil, fmt.Errorf("lsmsg: failed to parse event: %w", err)
+			}
+			return &ev, nil
+		}
 	}
-	return nil, nil
+
+	var ev Event
+	if err := json.Unmarshal([]byte(jsonStr), &ev); err != nil {
+		return nil, fmt.Errorf("lsmsg: failed to parse teams event: %w", err)
+	}
+	return &ev, nil
 }
 
 func (cgoBackend) SlackStripMentions(text string) string {

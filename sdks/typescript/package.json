@@ -6,7 +6,8 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench": "vitest bench --run --dir bench --maxWorkers 1"
   },
   "optionalDependencies": {
     "@lsmsg/native": "file:../../crates/lsmsg-napi"

@@ -1,4 +1,5 @@
 .PHONY: test test-rust test-python test-typescript test-go \
+       benchmark benchmark-python benchmark-typescript \
        lint format build clean dev
 
 # --------------------------------------------------------------------------
@@ -18,7 +19,18 @@ test-typescript:
 	cd sdks/typescript && npm test
 
 test-go: build-ffi
-	cd sdks/go && CGO_ENABLED=1 go test ./...
+	cd sdks/go && CGO_ENABLED=1 go test -tags integration ./...
+
+benchmark: benchmark-python benchmark-typescript
+
+benchmark-python:
+	cd sdks/python && uv run --with pytest --with pytest-asyncio --with pytest-benchmark \
+		python -m pytest benchmarks/ --benchmark-only --benchmark-enable \
+		--benchmark-min-rounds=100 --benchmark-warmup=on \
+		--benchmark-warmup-iterations=100
+
+benchmark-typescript:
+	cd sdks/typescript && npm run bench
 
 # --------------------------------------------------------------------------
 # Lint & format

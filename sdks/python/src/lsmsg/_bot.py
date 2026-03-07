@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import time
 from dataclasses import replace
 from typing import Any, Callable, Coroutine, Optional
 
@@ -26,7 +29,6 @@ try:
         TeamsParser as _TeamsParser,
         PyHandlerRegistry as _PyHandlerRegistry,
         PyLangGraphClient as _PyLangGraphClient,
-        deterministic_thread_id as _deterministic_thread_id,
     )
 
     _HAS_NATIVE = True
@@ -329,7 +331,7 @@ class Bot:
     def attach(self, app: Any, prefix: str = "/lsmsg") -> None:
         """Mount the bot's webhook routes onto an existing Starlette/FastAPI app."""
         self._prefix = prefix
-        sub_app = self._build_app(prefix)
+        sub_app = self._build_app("")
         app.mount(prefix, sub_app)
 
     # ------------------------------------------------------------------
@@ -344,19 +346,30 @@ class Bot:
         if self.slack_signing_secret:
             timestamp = request.headers.get("x-slack-request-timestamp", "")
             signature = request.headers.get("x-slack-signature", "")
-            if timestamp and signature:
-                if _HAS_NATIVE:
-                    valid = await asyncio.to_thread(
-                        _SlackParser.verify_signature,
-                        self.slack_signing_secret,
-                        timestamp,
-                        signature,
-                        body,
-                    )
-                    if not valid:
-                        return JSONResponse(
-                            {"error": "invalid signature"}, status_code=401
-                        )
+            if not timestamp or not signature:
+                return JSONResponse(
+                    {"error": "missing signature headers"}, status_code=401
+                )
+
+            if _HAS_NATIVE:
+                valid = await asyncio.to_thread(
+                    _SlackParser.verify_signature,
+                    self.slack_signing_secret,
+                    timestamp,
+                    signature,
+                    body,
+                )
+            else:
+                valid = await asyncio.to_thread(
+                    _verify_slack_signature_python,
+                    self.slack_signing_secret,
+                    timestamp,
+                    signature,
+                    body,
+                )
+
+            if not valid:
+                return JSONResponse({"error": "invalid signature"}, status_code=401)
 
         # Parse the webhook
         if _HAS_NATIVE:
@@ -644,6 +657,27 @@ def _parse_slack_webhook_python(body: bytes, content_type: str) -> dict[str, Any
         result_event["emoji"] = emoji
 
     return {"type": "event", "event": result_event}
+
+
+def _verify_slack_signature_python(
+    signing_secret: str, timestamp: str, signature: str, body: bytes
+) -> bool:
+    """Verify Slack request signatures without the native extension."""
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False
+
+    now = int(time.time())
+    if abs(now - ts) > 60 * 5:
+        return False
+
+    basestring = b"v0:" + timestamp.encode("utf-8") + b":" + body
+    digest = hmac.new(
+        signing_secret.encode("utf-8"), basestring, hashlib.sha256
+    ).hexdigest()
+    expected = f"v0={digest}"
+    return hmac.compare_digest(expected, signature)
 
 
 def _parse_teams_webhook_python(payload: dict[str, Any]) -> Optional[dict[str, Any]]:

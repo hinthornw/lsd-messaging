@@ -61,6 +61,8 @@ bot.onMention(async (event) => {
 app.use('/webhooks', bot.expressMiddleware());
 ```
 
+`expressMiddleware()` installs the route-local body parsers needed for Slack signature verification, so avoid reserializing webhook bodies before they reach lsmsg.
+
 ## Quickstart (Go)
 
 ```go
@@ -120,7 +122,10 @@ make test            # run all tests (Rust + Python + TypeScript + Go)
 make test-rust       # cargo test
 make test-python     # pytest
 make test-typescript # vitest
-make test-go         # go test (builds Rust FFI first)
+make test-go         # go test + cgo integration tests (builds Rust FFI first)
+make benchmark       # run Python + TypeScript microbenchmarks
+make benchmark-python
+make benchmark-typescript
 make lint            # cargo fmt/clippy + ruff + tsc
 make format          # auto-format Rust + Python
 make build           # build all artifacts

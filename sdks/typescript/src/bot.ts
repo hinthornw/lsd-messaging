@@ -27,6 +27,15 @@ export function setNativeModule(mod: any): void {
   native = mod;
 }
 
+function assertNativeAvailable(): void {
+  if (native) {
+    return;
+  }
+  throw new Error(
+    'lsmsg native bindings are unavailable. Install @lsmsg/native or inject a test double with setNativeModule().',
+  );
+}
+
 /** @internal Convert snake_case napi event JSON to camelCase Event with methods. */
 function toEvent(raw: Record<string, any>, bot: Bot): Event {
   const platform: PlatformCapabilities = {
@@ -102,6 +111,8 @@ interface RegisteredHandler {
   callback: EventHandler;
 }
 
+type RawBodyRequest = Request & { rawBody?: Buffer | string };
+
 /**
  * The main Bot class. Provides an idiomatic Node.js API for registering
  * event handlers and processing webhooks from Slack, Teams, and other platforms.
@@ -115,6 +126,7 @@ export class Bot {
     | undefined;
 
   constructor(config: BotConfig) {
+    assertNativeAvailable();
     this.config = config;
     this.registry = new native.HandlerRegistry();
 
@@ -158,12 +170,18 @@ export class Bot {
     return this._register('reaction', undefined, emoji, options, handler);
   }
 
-  /**
-   * Register a handler for a specific event kind.
-   * This is a general-purpose registration method.
-   */
-  on(eventKind: EventKind, handler: EventHandler, options?: HandlerOptions): number {
-    return this._register(eventKind, undefined, undefined, options, handler);
+  /** Register a handler for a raw platform event type or a broad event kind. */
+  on(eventType: EventKind | string, handler: EventHandler, options?: HandlerOptions): number {
+    if (
+      eventType === 'message'
+      || eventType === 'mention'
+      || eventType === 'command'
+      || eventType === 'reaction'
+      || eventType === 'raw'
+    ) {
+      return this._register(eventType, undefined, undefined, options, handler);
+    }
+    return this._register('raw', undefined, undefined, options, handler, eventType);
   }
 
   /** Remove a previously registered handler. Returns true if it existed. */
@@ -187,8 +205,14 @@ export class Bot {
       return;
     }
 
-    // Read raw body
-    const rawBody = await getRawBody(req);
+    let rawBody: string;
+    try {
+      rawBody = await getRawBody(req, Boolean(signingSecret));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Invalid request body';
+      res.status(400).json({ error: message });
+      return;
+    }
     const timestamp = (req.headers['x-slack-request-timestamp'] as string) ?? '';
     const signature = (req.headers['x-slack-signature'] as string) ?? '';
 
@@ -256,8 +280,15 @@ export class Bot {
     const express = require('express');
     const router: Router = express.Router();
     const base = prefix ? prefix.replace(/\/+$/, '') : '';
+    const slackBodyParser = express.raw({
+      type: () => true,
+      verify: (req: RawBodyRequest, _res: Response, buf: Buffer) => {
+        req.rawBody = Buffer.from(buf);
+      },
+    });
+    const teamsBodyParser = express.json();
 
-    router.post(`${base}/slack/events`, (req, res) => {
+    router.post(`${base}/slack/events`, slackBodyParser, (req, res) => {
       this.handleSlackWebhook(req, res).catch((err) => {
         console.error('[lsmsg] Slack webhook error:', err);
         if (!res.headersSent) {
@@ -266,7 +297,7 @@ export class Bot {
       });
     });
 
-    router.post(`${base}/teams/events`, (req, res) => {
+    router.post(`${base}/teams/events`, teamsBodyParser, (req, res) => {
       this.handleTeamsWebhook(req, res).catch((err) => {
         console.error('[lsmsg] Teams webhook error:', err);
         if (!res.headersSent) {
@@ -285,8 +316,6 @@ export class Bot {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const express = require('express');
     const app = express();
-    app.use(express.json());
-    app.use(express.raw({ type: 'application/x-www-form-urlencoded' }));
     app.use(this.expressMiddleware());
     app.listen(port, () => {
       console.log(`[lsmsg] Bot listening on port ${port}`);
@@ -385,6 +414,7 @@ export class Bot {
     emoji: string | undefined,
     options: HandlerOptions | undefined,
     callback: EventHandler,
+    rawEventType?: string,
   ): number {
     const id: number = this.registry.register(
       eventKind,
@@ -392,7 +422,7 @@ export class Bot {
       options?.pattern ?? null,
       emoji ?? null,
       options?.platform ?? null,
-      null, // rawEventType
+      rawEventType ?? null,
     );
     this.handlers.set(id, { id, callback });
     return id;
@@ -459,7 +489,13 @@ function extractText(result: any): string {
   return '';
 }
 
-async function getRawBody(req: Request): Promise<string> {
+async function getRawBody(req: RawBodyRequest, requireOriginalBody = false): Promise<string> {
+  if (Buffer.isBuffer(req.rawBody)) {
+    return req.rawBody.toString('utf-8');
+  }
+  if (typeof req.rawBody === 'string') {
+    return req.rawBody;
+  }
   // If body is already parsed as a Buffer or string
   if (Buffer.isBuffer(req.body)) {
     return req.body.toString('utf-8');
@@ -467,8 +503,12 @@ async function getRawBody(req: Request): Promise<string> {
   if (typeof req.body === 'string') {
     return req.body;
   }
-  // If body is parsed JSON, re-serialize
   if (req.body && typeof req.body === 'object') {
+    if (requireOriginalBody) {
+      throw new Error(
+        'Slack signature verification requires the original raw request body. Use bot.expressMiddleware() or provide req.rawBody.',
+      );
+    }
     return JSON.stringify(req.body);
   }
   // Read from stream

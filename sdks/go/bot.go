@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -56,7 +57,7 @@ type BotConfig struct {
 // SlackConfig holds Slack-specific configuration.
 type SlackConfig struct {
 	SigningSecret string
-	BotToken     string
+	BotToken      string
 }
 
 // TeamsConfig holds Teams-specific configuration.
@@ -92,8 +93,12 @@ type Bot struct {
 	handlers []handlerEntry
 	nextID   int64
 
-	// lgHandle is the FFI handle for the LangGraph client (0 if not configured).
+	// lgHandle is the FFI handle for the LangGraph client. Handle 0 is valid.
 	lgHandle int64
+
+	langGraphConfigured bool
+	httpClient          *http.Client
+	slackAPIBaseURL     string
 }
 
 // defaultBackend is set by the cgo init function. It is nil when the shared
@@ -119,9 +124,12 @@ func newBotWithBackend(config BotConfig, backend ffiBackend) *Bot {
 		config.MaxPendingTasks = 100
 	}
 	b := &Bot{
-		config: config,
-		ffi:    backend,
-		nextID: 1,
+		config:              config,
+		ffi:                 backend,
+		nextID:              1,
+		langGraphConfigured: config.LangGraph != nil,
+		httpClient:          http.DefaultClient,
+		slackAPIBaseURL:     "https://slack.com",
 	}
 	if config.LangGraph != nil {
 		b.lgHandle = b.ffi.LangGraphNew(config.LangGraph.URL, config.LangGraph.APIKey)
@@ -372,7 +380,7 @@ func (e *Event) Invoke(agent string, opts ...InvokeOpt) (*RunResult, error) {
 	if e.bot == nil {
 		return nil, errors.New("lsmsg: event not associated with a bot")
 	}
-	if e.bot.lgHandle == 0 {
+	if !e.bot.langGraphConfigured {
 		return nil, errors.New("lsmsg: LangGraph not configured")
 	}
 
@@ -398,9 +406,8 @@ func (e *Event) Invoke(agent string, opts ...InvokeOpt) (*RunResult, error) {
 	}
 
 	params := map[string]any{
-		"assistant_id":  agent,
-		"thread_id":     threadID,
-		"if_not_exists": "create",
+		"agent":     agent,
+		"thread_id": threadID,
 	}
 	if input != nil {
 		params["input"] = input
@@ -459,7 +466,8 @@ func (e *Event) replySlack(text string) error {
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest(http.MethodPost, "https://slack.com/api/chat.postMessage", nil)
+	url := strings.TrimRight(e.bot.slackAPIBaseURL, "/") + "/api/chat.postMessage"
+	req, err := http.NewRequest(http.MethodPost, url, nil)
 	if err != nil {
 		return err
 	}
@@ -467,15 +475,29 @@ func (e *Event) replySlack(text string) error {
 	req.Header.Set("Authorization", "Bearer "+e.bot.config.Slack.BotToken)
 	req.Body = io.NopCloser(jsonReader(body))
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := e.bot.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("lsmsg: slack reply failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("lsmsg: slack reply returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return fmt.Errorf("lsmsg: slack reply returned invalid JSON: %w", err)
+	}
+	if !result.OK {
+		if result.Error == "" {
+			result.Error = "unknown_error"
+		}
+		return fmt.Errorf("lsmsg: slack reply failed: %s", result.Error)
 	}
 	return nil
 }

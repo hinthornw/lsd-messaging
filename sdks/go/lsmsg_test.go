@@ -11,15 +11,17 @@ import (
 
 // mockBackend implements ffiBackend for unit testing without the Rust shared library.
 type mockBackend struct {
-	verifyResult   bool
-	parseSlackFn   func(body []byte, contentType string) (*Event, string, error)
-	parseTeamsFn   func(payloadJSON []byte) (*Event, error)
-	stripSlackFn   func(text string) string
-	stripTeamsFn   func(text string) string
-	threadIDFn     func(platform, workspaceID, channelID, threadID string) string
-	createRunFn    func(handle int64, paramsJSON []byte) (string, error)
-	waitRunFn      func(handle int64, threadID, runID string) (*RunResult, error)
-	cancelRunFn    func(handle int64, threadID, runID string) error
+	verifyResult       bool
+	langGraphHandle    int64
+	langGraphHandleSet bool
+	parseSlackFn       func(body []byte, contentType string) (*Event, string, error)
+	parseTeamsFn       func(payloadJSON []byte) (*Event, error)
+	stripSlackFn       func(text string) string
+	stripTeamsFn       func(text string) string
+	threadIDFn         func(platform, workspaceID, channelID, threadID string) string
+	createRunFn        func(handle int64, paramsJSON []byte) (string, error)
+	waitRunFn          func(handle int64, threadID, runID string) (*RunResult, error)
+	cancelRunFn        func(handle int64, threadID, runID string) error
 }
 
 func (m *mockBackend) SlackVerifySignature(_, _, _ string, _ []byte) bool {
@@ -61,15 +63,21 @@ func (m *mockBackend) DeterministicThreadID(platform, workspaceID, channelID, th
 	return platform + ":" + workspaceID + ":" + channelID + ":" + threadID
 }
 
-func (m *mockBackend) RegistryNew() int64            { return 1 }
-func (m *mockBackend) RegistryFree(_ int64)           {}
+func (m *mockBackend) RegistryNew() int64                       { return 1 }
+func (m *mockBackend) RegistryFree(_ int64)                     {}
 func (m *mockBackend) RegistryRegister(_ int64, _ []byte) int64 { return 1 }
 func (m *mockBackend) RegistryMatchEvent(_ int64, _ []byte) ([]int64, error) {
 	return nil, nil
 }
 
-func (m *mockBackend) LangGraphNew(_, _ string) int64 { return 1 }
-func (m *mockBackend) LangGraphFree(_ int64)          {}
+func (m *mockBackend) LangGraphNew(_, _ string) int64 {
+	if m.langGraphHandleSet {
+		return m.langGraphHandle
+	}
+	return 1
+}
+
+func (m *mockBackend) LangGraphFree(_ int64) {}
 
 func (m *mockBackend) LangGraphCreateRun(handle int64, paramsJSON []byte) (string, error) {
 	if m.createRunFn != nil {
@@ -416,8 +424,8 @@ func TestEventInvoke(t *testing.T) {
 		createRunFn: func(handle int64, paramsJSON []byte) (string, error) {
 			var params map[string]any
 			json.Unmarshal(paramsJSON, &params)
-			if params["assistant_id"] != "my-agent" {
-				t.Errorf("expected assistant_id=my-agent, got %v", params["assistant_id"])
+			if params["agent"] != "my-agent" {
+				t.Errorf("expected agent=my-agent, got %v", params["agent"])
 			}
 			return "run-456", nil
 		},
@@ -453,6 +461,51 @@ func TestEventInvoke(t *testing.T) {
 	}
 	if result.Text() != "bot says hi" {
 		t.Errorf("expected 'bot says hi', got %q", result.Text())
+	}
+}
+
+func TestEventInvokeAllowsZeroLangGraphHandle(t *testing.T) {
+	mock := &mockBackend{
+		langGraphHandle:    0,
+		langGraphHandleSet: true,
+		createRunFn: func(handle int64, paramsJSON []byte) (string, error) {
+			if handle != 0 {
+				t.Errorf("expected zero handle, got %d", handle)
+			}
+			return "run-0", nil
+		},
+		waitRunFn: func(handle int64, threadID, runID string) (*RunResult, error) {
+			if handle != 0 {
+				t.Errorf("expected zero handle, got %d", handle)
+			}
+			return &RunResult{
+				ID:     runID,
+				Status: "completed",
+				Output: json.RawMessage(`{"messages":[{"content":"zero handle works"}]}`),
+			}, nil
+		},
+	}
+
+	bot := newBotWithBackend(BotConfig{
+		LangGraph: &LangGraphConfig{URL: "http://localhost:8123"},
+	}, mock)
+
+	event := &Event{
+		Kind:        EventMention,
+		Platform:    PlatformCapabilities{Name: PlatformSlack},
+		WorkspaceID: "T1",
+		ChannelID:   "C1",
+		ThreadID:    "t1",
+		Text:        "hello bot",
+		bot:         bot,
+	}
+
+	result, err := event.Invoke("my-agent")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Text() != "zero handle works" {
+		t.Errorf("expected zero-handle result text, got %q", result.Text())
 	}
 }
 
@@ -520,13 +573,11 @@ func TestEventReplySlack(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// We need to override the Slack API URL. Since Reply uses http.DefaultClient
-	// and a hardcoded URL, we test the error path instead. A full integration
-	// test would need the real Slack API or a URL override.
-	// For this unit test, we verify the function reaches the HTTP call.
 	bot := newBotWithBackend(BotConfig{
 		Slack: &SlackConfig{BotToken: "xoxb-test-token"},
 	}, &mockBackend{})
+	bot.httpClient = server.Client()
+	bot.slackAPIBaseURL = server.URL
 	event := &Event{
 		Kind:      EventMention,
 		Platform:  PlatformCapabilities{Name: PlatformSlack},
@@ -535,9 +586,36 @@ func TestEventReplySlack(t *testing.T) {
 		bot:       bot,
 	}
 
-	// This will attempt to call the real Slack API and fail, which is expected
-	// in a unit test environment. The important thing is it doesn't panic.
-	_ = event.Reply("reply text")
+	if err := event.Reply("reply text"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEventReplySlackAPIErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":false,"error":"channel_not_found"}`))
+	}))
+	defer server.Close()
+
+	bot := newBotWithBackend(BotConfig{
+		Slack: &SlackConfig{BotToken: "xoxb-test-token"},
+	}, &mockBackend{})
+	bot.httpClient = server.Client()
+	bot.slackAPIBaseURL = server.URL
+
+	event := &Event{
+		Kind:      EventMention,
+		Platform:  PlatformCapabilities{Name: PlatformSlack},
+		ChannelID: "C123",
+		ThreadID:  "t123",
+		bot:       bot,
+	}
+
+	err := event.Reply("reply text")
+	if err == nil || !strings.Contains(err.Error(), "channel_not_found") {
+		t.Fatalf("expected Slack API error, got %v", err)
+	}
 }
 
 func TestRunResultText(t *testing.T) {
@@ -655,4 +733,3 @@ func TestAutoDetectSlackByHeader(t *testing.T) {
 		t.Error("expected Slack handler to be auto-detected and dispatched")
 	}
 }
-

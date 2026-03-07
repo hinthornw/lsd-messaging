@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import time
 
 import pytest
 
 from lsmsg._bot import Bot
+
+
+def make_slack_headers(
+    body: bytes, *, content_type: str = "application/json", secret: str = "test-secret"
+) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    basestring = b"v0:" + timestamp.encode("utf-8") + b":" + body
+    digest = hmac.new(secret.encode("utf-8"), basestring, hashlib.sha256).hexdigest()
+    return {
+        "content-type": content_type,
+        "x-slack-request-timestamp": timestamp,
+        "x-slack-signature": f"v0={digest}",
+    }
 
 
 class TestBotCreation:
@@ -323,13 +340,18 @@ class TestASGI:
     async def test_slack_url_verification(self, bot):
         from httpx import ASGITransport, AsyncClient
 
+        body = json.dumps(
+            {"type": "url_verification", "challenge": "abc123"},
+            separators=(",", ":"),
+        ).encode()
+
         async with AsyncClient(
             transport=ASGITransport(app=bot), base_url="http://test"
         ) as client:
             resp = await client.post(
                 "/slack/events",
-                json={"type": "url_verification", "challenge": "abc123"},
-                headers={"content-type": "application/json"},
+                content=body,
+                headers=make_slack_headers(body),
             )
             assert resp.status_code == 200
             assert resp.json()["challenge"] == "abc123"
@@ -344,23 +366,28 @@ class TestASGI:
 
         from httpx import ASGITransport, AsyncClient
 
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "team_id": "T1",
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@UBOT> hello",
+                    "channel": "C1",
+                    "ts": "123.456",
+                    "user": "U1",
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+
         async with AsyncClient(
             transport=ASGITransport(app=bot), base_url="http://test"
         ) as client:
             resp = await client.post(
                 "/slack/events",
-                json={
-                    "type": "event_callback",
-                    "team_id": "T1",
-                    "event": {
-                        "type": "app_mention",
-                        "text": "<@UBOT> hello",
-                        "channel": "C1",
-                        "ts": "123.456",
-                        "user": "U1",
-                    },
-                },
-                headers={"content-type": "application/json"},
+                content=body,
+                headers=make_slack_headers(body),
             )
             assert resp.status_code == 200
 
@@ -377,22 +404,27 @@ class TestASGI:
 
         from httpx import ASGITransport, AsyncClient
 
+        body = json.dumps(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "bot_id": "B1",
+                    "text": "bot message",
+                    "channel": "C1",
+                    "ts": "123.456",
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+
         async with AsyncClient(
             transport=ASGITransport(app=bot), base_url="http://test"
         ) as client:
             resp = await client.post(
                 "/slack/events",
-                json={
-                    "type": "event_callback",
-                    "event": {
-                        "type": "message",
-                        "bot_id": "B1",
-                        "text": "bot message",
-                        "channel": "C1",
-                        "ts": "123.456",
-                    },
-                },
-                headers={"content-type": "application/json"},
+                content=body,
+                headers=make_slack_headers(body),
             )
             assert resp.status_code == 200
 
@@ -409,18 +441,69 @@ class TestASGI:
 
         from httpx import ASGITransport, AsyncClient
 
+        body = (
+            b"command=%2Fecho&text=hello+world&team_id=T1&channel_id=C1&user_id=U1"
+            b"&trigger_id=trig1"
+        )
+
         async with AsyncClient(
             transport=ASGITransport(app=bot), base_url="http://test"
         ) as client:
             resp = await client.post(
                 "/slack/events",
-                content=b"command=%2Fecho&text=hello+world&team_id=T1&channel_id=C1&user_id=U1&trigger_id=trig1",
-                headers={"content-type": "application/x-www-form-urlencoded"},
+                content=body,
+                headers=make_slack_headers(
+                    body, content_type="application/x-www-form-urlencoded"
+                ),
             )
             assert resp.status_code == 200
 
         await bot.drain(timeout=5.0)
         assert "hello world" in called
+
+    @pytest.mark.asyncio
+    async def test_slack_missing_signature_headers_rejected(self, bot):
+        from httpx import ASGITransport, AsyncClient
+
+        body = json.dumps(
+            {"type": "url_verification", "challenge": "abc123"},
+            separators=(",", ":"),
+        ).encode()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=bot), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/slack/events",
+                content=body,
+                headers={"content-type": "application/json"},
+            )
+
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_attach_mounts_single_prefix(self, bot):
+        from starlette.applications import Starlette
+        from httpx import ASGITransport, AsyncClient
+
+        app = Starlette()
+        bot.attach(app)
+        body = json.dumps(
+            {"type": "url_verification", "challenge": "abc123"},
+            separators=(",", ":"),
+        ).encode()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/lsmsg/slack/events",
+                content=body,
+                headers=make_slack_headers(body),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["challenge"] == "abc123"
 
     @pytest.mark.asyncio
     async def test_teams_message(self, bot):
