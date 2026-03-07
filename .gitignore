@@ -1,3 +1,7 @@
+# Rust
+/target/
+Cargo.lock
+
 # Python
 __pycache__/
 *.py[cod]
@@ -7,9 +11,9 @@ dist/
 *.so
 *.dylib
 
-# Rust
-lsmsg-rs/target/
-*.dSYM/
+# Node / TypeScript
+node_modules/
+sdks/typescript/dist/
 
 # Testing
 .pytest_cache/
@@ -30,6 +34,6 @@ Thumbs.db
 .env
 *.env.local
 
-# uv
-uv.lock
+# Tools
+.ruff_cache/
 .langgraph_api/

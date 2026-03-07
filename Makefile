@@ -1,37 +1,69 @@
-.PHONY: install build dev test-watch test format lint clean
+.PHONY: test test-rust test-python test-typescript test-go \
+       lint format build clean dev
 
-install:
-	uv sync
+# --------------------------------------------------------------------------
+# Testing
+# --------------------------------------------------------------------------
 
-build:
-	uv build
-	cd lsmsg-rs && maturin build --release
+test: test-rust test-python test-typescript test-go
+
+test-rust:
+	cargo test -p lsmsg-core -p lsmsg-ffi
+
+test-python:
+	cd sdks/python && uv run --with pytest --with pytest-asyncio --with httpx --with anyio \
+		python -m pytest tests/ -q
+
+test-typescript:
+	cd sdks/typescript && npm test
+
+test-go: build-ffi
+	cd sdks/go && CGO_ENABLED=1 go test ./...
+
+# --------------------------------------------------------------------------
+# Lint & format
+# --------------------------------------------------------------------------
+
+lint:
+	cargo fmt --check
+	cargo clippy -p lsmsg-core -p lsmsg-ffi -- -D warnings
+	cd sdks/python && uv run --with ruff ruff check src tests
+	cd sdks/typescript && npm run build
+
+format:
+	cargo fmt
+	cd sdks/python && uv run --with ruff ruff format src tests && uv run --with ruff ruff check --fix src tests
+
+# --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+build-ffi:
+	cargo build --release -p lsmsg-ffi
+
+build-py:
+	cd sdks/python && pip install maturin && maturin build --release
+
+build-ts:
+	cd sdks/typescript && npm run build
+
+build: build-ffi build-py build-ts
+
+# --------------------------------------------------------------------------
+# Dev
+# --------------------------------------------------------------------------
 
 dev:
 	uv run langgraph dev --no-browser
 
-test-watch:
-	uv run ptw -- -x -q --tb=short tests/ --ignore=tests/integration
-
-test:
-	uv run pytest tests/ -v
-
-format:
-	uv run ruff format src tests
-	uv run ruff check --fix src tests
-	cd lsmsg-rs && cargo fmt
-
-lint:
-	uv run ruff check src tests
-	uv run ty check src
-	cd lsmsg-rs && cargo clippy -- -D warnings
+# --------------------------------------------------------------------------
+# Clean
+# --------------------------------------------------------------------------
 
 clean:
-	rm -rf dist/ .venv/
-	rm -rf lsmsg-rs/dist/ lsmsg-rs/.venv/ lsmsg-rs/target/
+	cargo clean
+	rm -rf sdks/python/dist/ sdks/python/.venv/
+	rm -rf sdks/typescript/dist/ sdks/typescript/node_modules/
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
-	find . -name "*.so" -delete 2>/dev/null || true
-	find . -name "*.dylib" -delete 2>/dev/null || true
-	find . -name "*.dSYM" -exec rm -rf {} + 2>/dev/null || true

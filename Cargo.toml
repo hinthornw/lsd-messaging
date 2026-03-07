@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lsmsg-core",
+    "crates/lsmsg-py",
+    "crates/lsmsg-napi",
+    "crates/lsmsg-ffi",
+]

@@ -1,7 +1,0 @@
-/target
-dist/
-.venv/
-.pytest_cache/
-python/chat_rs/_chat_rs*.so
-python/chat_rs/__pycache__/
-tests/**/__pycache__/

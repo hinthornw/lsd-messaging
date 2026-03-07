@@ -2,33 +2,32 @@
 
 from starlette.applications import Starlette
 
-from lsmsg import Bot, CommandEvent, MentionEvent, MessageEvent, Slack
+from lsmsg import Bot
 
 bot = Bot(
-    slack=Slack(signing_secret="dev-secret", bot_token="xoxb-dev"),
-    # teams=Teams(),
-    # discord=Discord(),
+    slack_signing_secret="dev-secret",
+    slack_bot_token="xoxb-dev",
+    langgraph_url="http://localhost:2024",
 )
 
 
 @bot.mention
-async def on_mention(event: MentionEvent) -> None:
+async def on_mention(event) -> None:
     result = await event.invoke("echo")
     await event.reply(result.text)
 
 
 @bot.command("/echo")
-async def on_echo(event: CommandEvent) -> None:
+async def on_echo(event) -> None:
     result = await event.invoke("echo")
     await event.reply(result.text)
 
 
 @bot.message
-async def on_message(event: MessageEvent) -> None:
-    msg = await event.reply("Thinking...")
-    async for chunk in event.stream("echo"):
-        if chunk.text:
-            await msg.update(chunk.text)
+async def on_message(event) -> None:
+    chunks = await event.stream("echo")
+    if chunks:
+        await event.reply(chunks[-1].text)
 
 
 app = Starlette()

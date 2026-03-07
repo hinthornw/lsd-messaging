@@ -1,0 +1,13 @@
+[package]
+name = "lsmsg-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI bindings for lsmsg-core (used by Go SDK)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+lsmsg-core = { path = "../lsmsg-core" }
+serde_json = "1"
