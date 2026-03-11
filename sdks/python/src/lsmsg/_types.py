@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PlatformCapabilities:
     name: str
     ephemeral: bool = False
@@ -29,7 +29,7 @@ class PlatformCapabilities:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UserInfo:
     id: str
     name: Optional[str] = None
@@ -40,7 +40,7 @@ class UserInfo:
         return cls(id=d["id"], name=d.get("name"), email=d.get("email"))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RunResult:
     id: str
     status: str
@@ -61,7 +61,7 @@ class RunResult:
         return cls(id=d["id"], status=d["status"], output=d.get("output"))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RunChunk:
     event: str = ""
     text: str = ""
@@ -78,7 +78,7 @@ class RunChunk:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class SentMessage:
     id: str
     platform: str
@@ -99,9 +99,9 @@ class SentMessage:
             await self._delete_fn(self)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Event:
-    """A normalized messaging event."""
+    """A normalized messaging event. Pure data — no methods with side effects."""
 
     kind: str
     platform: PlatformCapabilities
@@ -116,9 +116,6 @@ class Event:
     raw_event_type: Optional[str] = None
     raw: Any = None
     internal_thread_id: Optional[str] = None
-
-    # These are set by the Bot when dispatching so the event can call back.
-    _bot: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Event:
@@ -149,44 +146,3 @@ class Event:
             raw=d.get("raw"),
             internal_thread_id=d.get("internal_thread_id"),
         )
-
-    async def reply(self, text: str) -> Optional[SentMessage]:
-        """Send a reply in the same thread."""
-        if self._bot is not None:
-            return await self._bot.send_message(
-                platform=self.platform.name,
-                channel_id=self.channel_id,
-                thread_id=self.thread_id,
-                text=text,
-            )
-        return None
-
-    async def whisper(self, text: str) -> Optional[SentMessage]:
-        """Send an ephemeral reply visible only to the user (if supported)."""
-        if self._bot is not None:
-            return await self._bot.send_ephemeral(
-                platform=self.platform.name,
-                channel_id=self.channel_id,
-                thread_id=self.thread_id,
-                user_id=self.user.id,
-                text=text,
-            )
-        return None
-
-    async def invoke(self, agent: str, **kwargs: Any) -> RunResult:
-        """Invoke a LangGraph agent and wait for the result."""
-        if self._bot is None:
-            raise RuntimeError("Event is not bound to a Bot instance")
-        return await self._bot.invoke_agent(agent=agent, event=self, **kwargs)
-
-    async def stream(self, agent: str, **kwargs: Any) -> list[RunChunk]:
-        """Stream a LangGraph agent run, returning all chunks."""
-        if self._bot is None:
-            raise RuntimeError("Event is not bound to a Bot instance")
-        return await self._bot.stream_agent(agent=agent, event=self, **kwargs)
-
-    async def start(self, agent: str, **kwargs: Any) -> str:
-        """Start a LangGraph agent run in the background. Returns run ID."""
-        if self._bot is None:
-            raise RuntimeError("Event is not bound to a Bot instance")
-        return await self._bot.start_agent(agent=agent, event=self, **kwargs)

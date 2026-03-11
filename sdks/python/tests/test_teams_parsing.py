@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 
-from lsmsg._bot import _parse_teams_webhook_python
+from lsmsg._adapters import _parse_teams_webhook as _raw_parse
+
+
+def _parse_teams_webhook_python(payload):
+    """Wrapper that unwraps the dispatch envelope for backward-compat tests."""
+    result = _raw_parse(payload)
+    if result is None:
+        return None
+    if "event" in result:
+        return result["event"]
+    return result
 
 
 class TestTeamsMessages:

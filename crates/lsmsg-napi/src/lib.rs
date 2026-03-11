@@ -58,6 +58,39 @@ pub fn teams_strip_mentions(text: String) -> String {
     lsmsg_core::teams::strip_mentions(&text)
 }
 
+fn event_to_value(event: &lsmsg_core::Event) -> serde_json::Value {
+    let mut value = serde_json::to_value(event).unwrap_or(Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "internal_thread_id".into(),
+            serde_json::Value::String(event.internal_thread_id()),
+        );
+    }
+    value
+}
+
+fn webhook_outcome_to_value(outcome: lsmsg_core::WebhookOutcome) -> serde_json::Value {
+    match outcome {
+        lsmsg_core::WebhookOutcome::Rejected {
+            status_code,
+            message,
+        } => serde_json::json!({
+            "type": "rejected",
+            "status_code": status_code,
+            "error": message,
+        }),
+        lsmsg_core::WebhookOutcome::Challenge(challenge) => {
+            serde_json::json!({ "type": "challenge", "challenge": challenge })
+        }
+        lsmsg_core::WebhookOutcome::Ignored => serde_json::json!({ "type": "ignored" }),
+        lsmsg_core::WebhookOutcome::Dispatch(plan) => serde_json::json!({
+            "type": "dispatch",
+            "event": event_to_value(&plan.event),
+            "handler_ids": plan.handler_ids,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handler Registry
 // ---------------------------------------------------------------------------
@@ -111,87 +144,31 @@ impl HandlerRegistry {
             .map(|id| id as i64)
             .collect())
     }
-}
-
-// ---------------------------------------------------------------------------
-// LangGraph Client
-// ---------------------------------------------------------------------------
-
-#[napi]
-pub struct LangGraphClient {
-    inner: lsmsg_core::LangGraphClient,
-}
-
-#[napi]
-impl LangGraphClient {
-    #[napi(constructor)]
-    pub fn new(base_url: String, api_key: Option<String>) -> Self {
-        Self {
-            inner: lsmsg_core::LangGraphClient::new(&base_url, api_key.as_deref()),
-        }
-    }
 
     #[napi]
-    pub fn create_run(
+    pub fn process_slack_webhook(
         &self,
-        agent: String,
-        thread_id: String,
-        input: Option<serde_json::Value>,
-        config: Option<serde_json::Value>,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<String> {
-        let params = lsmsg_core::CreateRunParams {
-            agent,
-            thread_id,
-            input,
-            config,
-            metadata,
-        };
-        self.inner
-            .create_run(&params)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        body: Buffer,
+        content_type: String,
+        signing_secret: Option<String>,
+        timestamp: Option<String>,
+        signature: Option<String>,
+    ) -> serde_json::Value {
+        let outcome = lsmsg_core::process_slack_webhook(
+            &body,
+            &content_type,
+            signing_secret.as_deref(),
+            timestamp.as_deref(),
+            signature.as_deref(),
+            &self.inner,
+        );
+        webhook_outcome_to_value(outcome)
     }
 
     #[napi]
-    pub fn wait_run(&self, thread_id: String, run_id: String) -> Result<serde_json::Value> {
-        let result = self
-            .inner
-            .wait_run(&thread_id, &run_id)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        serde_json::to_value(&result).map_err(|e| Error::from_reason(e.to_string()))
-    }
-
-    #[napi]
-    pub fn stream_new_run(
-        &self,
-        agent: String,
-        thread_id: String,
-        input: Option<serde_json::Value>,
-        config: Option<serde_json::Value>,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<Vec<serde_json::Value>> {
-        let params = lsmsg_core::CreateRunParams {
-            agent,
-            thread_id,
-            input,
-            config,
-            metadata,
-        };
-        let chunks = self
-            .inner
-            .stream_new_run_collect(&params)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        chunks
-            .iter()
-            .map(|c| serde_json::to_value(c).map_err(|e| Error::from_reason(e.to_string())))
-            .collect()
-    }
-
-    #[napi]
-    pub fn cancel_run(&self, thread_id: String, run_id: String) -> Result<()> {
-        self.inner
-            .cancel_run(&thread_id, &run_id)
-            .map_err(|e| Error::from_reason(e.to_string()))
+    pub fn process_teams_webhook(&self, body: Buffer) -> serde_json::Value {
+        let outcome = lsmsg_core::process_teams_webhook(&body, &self.inner);
+        webhook_outcome_to_value(outcome)
     }
 }
 

@@ -46,13 +46,20 @@ int64_t lsmsg_registry_new(void);
 void lsmsg_registry_free(int64_t handle);
 int64_t lsmsg_registry_register(int64_t handle, const char *fields_json);
 char *lsmsg_registry_match_event(int64_t handle, const char *event_json);
-
-/* LangGraph Client */
-int64_t lsmsg_langgraph_new(const char *base_url, const char *api_key);
-void lsmsg_langgraph_free(int64_t handle);
-char *lsmsg_langgraph_create_run(int64_t handle, const char *params_json);
-char *lsmsg_langgraph_wait_run(int64_t handle, const char *thread_id, const char *run_id);
-char *lsmsg_langgraph_cancel_run(int64_t handle, const char *thread_id, const char *run_id);
+char *lsmsg_registry_process_slack_webhook(
+    int64_t handle,
+    const uint8_t *body,
+    size_t body_len,
+    const char *content_type,
+    const char *signing_secret,
+    const char *timestamp,
+    const char *signature
+);
+char *lsmsg_registry_process_teams_webhook(
+    int64_t handle,
+    const uint8_t *body,
+    size_t body_len
+);
 
 #ifdef __cplusplus
 }

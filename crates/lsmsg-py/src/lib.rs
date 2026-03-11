@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde_json::Value;
 
 use lsmsg_core::{
-    CreateRunParams, Event, EventKind, HandlerRegistry, LangGraphClient, Platform,
-    PlatformCapabilities, RunChunk, RunResult,
+    Event, EventKind, HandlerRegistry, Platform, PlatformCapabilities, WebhookOutcome,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,14 +62,6 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         .map_err(|e| PyValueError::new_err(format!("failed to convert Python object to JSON: {e}")))
 }
 
-fn optional_py_to_value(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Value>> {
-    match obj {
-        None => Ok(None),
-        Some(o) if o.is_none() => Ok(None),
-        Some(o) => Ok(Some(py_to_value(o)?)),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Event → Python dict
 // ---------------------------------------------------------------------------
@@ -109,6 +100,33 @@ fn platform_caps_to_py(py: Python<'_>, caps: &PlatformCapabilities) -> PyResult<
     dict.set_item("streaming", caps.streaming)?;
     dict.set_item("modals", caps.modals)?;
     dict.set_item("typing_indicator", caps.typing_indicator)?;
+    Ok(dict.into_pyobject(py).unwrap().into_any().unbind())
+}
+
+fn webhook_outcome_to_py(py: Python<'_>, outcome: WebhookOutcome) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    match outcome {
+        WebhookOutcome::Rejected {
+            status_code,
+            message,
+        } => {
+            dict.set_item("type", "rejected")?;
+            dict.set_item("status_code", status_code)?;
+            dict.set_item("error", message)?;
+        }
+        WebhookOutcome::Challenge(challenge) => {
+            dict.set_item("type", "challenge")?;
+            dict.set_item("challenge", challenge)?;
+        }
+        WebhookOutcome::Ignored => {
+            dict.set_item("type", "ignored")?;
+        }
+        WebhookOutcome::Dispatch(plan) => {
+            dict.set_item("type", "dispatch")?;
+            dict.set_item("event", event_to_py(py, &plan.event)?)?;
+            dict.set_item("handler_ids", plan.handler_ids)?;
+        }
+    }
     Ok(dict.into_pyobject(py).unwrap().into_any().unbind())
 }
 
@@ -247,6 +265,32 @@ impl PyHandlerRegistry {
             .map_err(|e| PyValueError::new_err(format!("invalid event: {e}")))?;
         Ok(self.inner.match_event(&event))
     }
+
+    #[pyo3(signature = (body, content_type, signing_secret=None, timestamp=None, signature=None))]
+    fn process_slack_webhook(
+        &self,
+        py: Python<'_>,
+        body: &[u8],
+        content_type: &str,
+        signing_secret: Option<&str>,
+        timestamp: Option<&str>,
+        signature: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let outcome = lsmsg_core::process_slack_webhook(
+            body,
+            content_type,
+            signing_secret,
+            timestamp,
+            signature,
+            &self.inner,
+        );
+        webhook_outcome_to_py(py, outcome)
+    }
+
+    fn process_teams_webhook(&self, py: Python<'_>, body: &[u8]) -> PyResult<PyObject> {
+        let outcome = lsmsg_core::process_teams_webhook(body, &self.inner);
+        webhook_outcome_to_py(py, outcome)
+    }
 }
 
 fn str_to_event_kind(s: &str) -> PyResult<EventKind> {
@@ -271,111 +315,6 @@ fn str_to_platform(s: &str) -> PyResult<Platform> {
         "gchat" => Ok(Platform::Gchat),
         _ => Err(PyValueError::new_err(format!("unknown platform: {s}"))),
     }
-}
-
-// ---------------------------------------------------------------------------
-// PyLangGraphClient
-// ---------------------------------------------------------------------------
-
-#[pyclass]
-struct PyLangGraphClient {
-    inner: LangGraphClient,
-}
-
-#[pymethods]
-impl PyLangGraphClient {
-    #[new]
-    #[pyo3(signature = (base_url, api_key=None))]
-    fn new(base_url: &str, api_key: Option<&str>) -> Self {
-        Self {
-            inner: LangGraphClient::new(base_url, api_key),
-        }
-    }
-
-    /// Create a run. Returns the run ID string.
-    #[pyo3(signature = (agent, thread_id, input=None, config=None, metadata=None))]
-    fn create_run(
-        &self,
-        agent: &str,
-        thread_id: &str,
-        input: Option<&Bound<'_, PyAny>>,
-        config: Option<&Bound<'_, PyAny>>,
-        metadata: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<String> {
-        let params = CreateRunParams {
-            agent: agent.to_string(),
-            thread_id: thread_id.to_string(),
-            input: optional_py_to_value(input)?,
-            config: optional_py_to_value(config)?,
-            metadata: optional_py_to_value(metadata)?,
-        };
-        self.inner
-            .create_run(&params)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Wait for a run to complete. Returns a dict with id, status, output.
-    fn wait_run(&self, py: Python<'_>, thread_id: &str, run_id: &str) -> PyResult<PyObject> {
-        let result = self
-            .inner
-            .wait_run(thread_id, run_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        run_result_to_py(py, &result)
-    }
-
-    /// Stream a new run, collecting all chunks. Returns list of chunk dicts.
-    #[pyo3(signature = (agent, thread_id, input=None, config=None, metadata=None))]
-    fn stream_new_run(
-        &self,
-        py: Python<'_>,
-        agent: &str,
-        thread_id: &str,
-        input: Option<&Bound<'_, PyAny>>,
-        config: Option<&Bound<'_, PyAny>>,
-        metadata: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PyObject> {
-        let params = CreateRunParams {
-            agent: agent.to_string(),
-            thread_id: thread_id.to_string(),
-            input: optional_py_to_value(input)?,
-            config: optional_py_to_value(config)?,
-            metadata: optional_py_to_value(metadata)?,
-        };
-        let chunks = self
-            .inner
-            .stream_new_run_collect(&params)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let list = PyList::empty(py);
-        for chunk in &chunks {
-            list.append(run_chunk_to_py(py, chunk)?)?;
-        }
-        Ok(list.into_pyobject(py).unwrap().into_any().unbind())
-    }
-
-    fn cancel_run(&self, thread_id: &str, run_id: &str) -> PyResult<()> {
-        self.inner
-            .cancel_run(thread_id, run_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-}
-
-fn run_result_to_py(py: Python<'_>, result: &RunResult) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
-    dict.set_item("id", &result.id)?;
-    dict.set_item("status", &result.status)?;
-    dict.set_item("output", value_to_py(py, &result.output))?;
-    dict.set_item("text", result.text())?;
-    Ok(dict.into_pyobject(py).unwrap().into_any().unbind())
-}
-
-fn run_chunk_to_py(py: Python<'_>, chunk: &RunChunk) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
-    dict.set_item("event", &chunk.event)?;
-    dict.set_item("text", &chunk.text)?;
-    dict.set_item("text_delta", &chunk.text_delta)?;
-    dict.set_item("data", value_to_py(py, &chunk.data))?;
-    Ok(dict.into_pyobject(py).unwrap().into_any().unbind())
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +353,6 @@ fn _lsmsg_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SlackParser>()?;
     m.add_class::<TeamsParser>()?;
     m.add_class::<PyHandlerRegistry>()?;
-    m.add_class::<PyLangGraphClient>()?;
     m.add_function(wrap_pyfunction!(deterministic_thread_id, m)?)?;
     m.add_function(wrap_pyfunction!(platform_capabilities, m)?)?;
     Ok(())

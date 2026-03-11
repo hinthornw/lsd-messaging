@@ -10,6 +10,8 @@ const mockRegistry = {
   register: vi.fn(),
   unregister: vi.fn(),
   matchEvent: vi.fn(),
+  processSlackWebhook: vi.fn(),
+  processTeamsWebhook: vi.fn(),
 };
 
 const mockLangGraphClient = {
@@ -128,6 +130,20 @@ describe('Bot', () => {
     vi.clearAllMocks();
     mockRegistry.register.mockReturnValue(1);
     mockRegistry.matchEvent.mockReturnValue([]);
+    mockRegistry.processSlackWebhook.mockReturnValue({
+      type: 'dispatch',
+      event: {
+        ...mockNative.slackParseWebhook().event,
+      },
+      handler_ids: [1],
+    });
+    mockRegistry.processTeamsWebhook.mockReturnValue({
+      type: 'dispatch',
+      event: {
+        ...mockNative.teamsParseWebhook(),
+      },
+      handler_ids: [1],
+    });
   });
 
   describe('creation and configuration', () => {
@@ -271,12 +287,11 @@ describe('Bot', () => {
   });
 
   describe('Slack webhook handling', () => {
-    it('verifies signature and dispatches event', async () => {
+    it('dispatches event through the shared ingress pipeline', async () => {
       const bot = new Bot(makeConfig());
       const handler = vi.fn();
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest({ body: '{"event":{}}' });
       const res = mockResponse();
@@ -292,11 +307,21 @@ describe('Bot', () => {
       expect(handler.mock.calls[0][0].kind).toBe('mention');
       expect(handler.mock.calls[0][0].platform.name).toBe('slack');
       expect(handler.mock.calls[0][0].text).toBe('hello bot');
+      expect(mockRegistry.processSlackWebhook).toHaveBeenCalledWith(
+        Buffer.from('{"event":{}}'),
+        'application/json',
+        'test-secret',
+        '1234567890',
+        'v0=abc123',
+      );
     });
 
     it('rejects invalid signature', async () => {
-      const { slackVerifySignature } = mockNative as any;
-      (slackVerifySignature as any).mockReturnValueOnce(false);
+      mockRegistry.processSlackWebhook.mockReturnValueOnce({
+        type: 'rejected',
+        status_code: 401,
+        error: 'invalid signature',
+      });
 
       const bot = new Bot(makeConfig());
       const req = mockRequest();
@@ -305,12 +330,11 @@ describe('Bot', () => {
       await bot.handleSlackWebhook(req, res);
 
       expect(res.statusCode).toBe(401);
-      expect(res.body).toEqual({ error: 'Invalid signature' });
+      expect(res.body).toEqual({ error: 'invalid signature' });
     });
 
     it('responds to URL verification challenge', async () => {
-      const { slackParseWebhook } = mockNative as any;
-      (slackParseWebhook as any).mockReturnValueOnce({
+      mockRegistry.processSlackWebhook.mockReturnValueOnce({
         type: 'challenge',
         challenge: 'test-challenge-token',
       });
@@ -326,8 +350,7 @@ describe('Bot', () => {
     });
 
     it('handles ignored events gracefully', async () => {
-      const { slackParseWebhook } = mockNative as any;
-      (slackParseWebhook as any).mockReturnValueOnce({ type: 'ignored' });
+      mockRegistry.processSlackWebhook.mockReturnValueOnce({ type: 'ignored' });
 
       const bot = new Bot(makeConfig());
       const req = mockRequest();
@@ -358,9 +381,8 @@ describe('Bot', () => {
       const handler = vi.fn();
       mockRegistry.register.mockReturnValue(1);
       bot.message(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
-      const req = mockRequest({ body: { type: 'message', text: 'hi' } });
+      const req = mockRequest({ body: Buffer.from('{"type":"message","text":"hi"}') });
       const res = mockResponse();
 
       await bot.handleTeamsWebhook(req, res);
@@ -373,13 +395,12 @@ describe('Bot', () => {
     });
 
     it('handles null parse result', async () => {
-      const { teamsParseWebhook } = mockNative as any;
-      (teamsParseWebhook as any).mockReturnValueOnce(null);
+      mockRegistry.processTeamsWebhook.mockReturnValueOnce({ type: 'ignored' });
 
       const bot = new Bot({
         teams: { appId: 'app', appPassword: 'pass' },
       });
-      const req = mockRequest({ body: {} });
+      const req = mockRequest({ body: Buffer.from('{}') });
       const res = mockResponse();
 
       await bot.handleTeamsWebhook(req, res);
@@ -397,7 +418,13 @@ describe('Bot', () => {
       mockRegistry.register.mockReturnValueOnce(1).mockReturnValueOnce(2);
       bot.mention(h1);
       bot.on('mention', h2);
-      mockRegistry.matchEvent.mockReturnValue([1, 2]);
+      mockRegistry.processSlackWebhook.mockReturnValueOnce({
+        type: 'dispatch',
+        event: {
+          ...mockNative.slackParseWebhook().event,
+        },
+        handler_ids: [1, 2],
+      });
 
       const req = mockRequest();
       const res = mockResponse();
@@ -414,7 +441,7 @@ describe('Bot', () => {
       const handler = vi.fn();
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([]);
+      mockRegistry.processSlackWebhook.mockReturnValueOnce({ type: 'ignored' });
 
       const req = mockRequest();
       const res = mockResponse();
@@ -433,7 +460,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();
@@ -465,7 +491,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();
@@ -491,7 +516,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();
@@ -509,7 +533,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();
@@ -527,7 +550,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();
@@ -575,7 +597,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();
@@ -600,7 +621,6 @@ describe('Bot', () => {
       });
       mockRegistry.register.mockReturnValue(1);
       bot.mention(handler);
-      mockRegistry.matchEvent.mockReturnValue([1]);
 
       const req = mockRequest();
       const res = mockResponse();

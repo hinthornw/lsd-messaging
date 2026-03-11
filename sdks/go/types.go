@@ -91,6 +91,15 @@ type RunChunk struct {
 	Data      json.RawMessage `json:"data"`
 }
 
+type webhookOutcome struct {
+	Type       string  `json:"type"`
+	StatusCode int     `json:"status_code,omitempty"`
+	Error      string  `json:"error,omitempty"`
+	Challenge  string  `json:"challenge,omitempty"`
+	Event      *Event  `json:"event,omitempty"`
+	HandlerIDs []int64 `json:"handler_ids,omitempty"`
+}
+
 // ffiBackend defines the interface for FFI calls, enabling mocking in tests.
 type ffiBackend interface {
 	SlackVerifySignature(signingSecret, timestamp, signature string, body []byte) bool
@@ -104,6 +113,8 @@ type ffiBackend interface {
 	RegistryFree(handle int64)
 	RegistryRegister(handle int64, fieldsJSON []byte) int64
 	RegistryMatchEvent(handle int64, eventJSON []byte) ([]int64, error)
+	RegistryProcessSlackWebhook(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error)
+	RegistryProcessTeamsWebhook(handle int64, body []byte) (*webhookOutcome, error)
 
 	LangGraphNew(baseURL, apiKey string) int64
 	LangGraphFree(handle int64)

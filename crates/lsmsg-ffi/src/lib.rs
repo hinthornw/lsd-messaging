@@ -38,6 +38,30 @@ fn from_c_str(s: *const c_char) -> Option<String> {
     unsafe { CStr::from_ptr(s).to_str().ok().map(String::from) }
 }
 
+fn webhook_outcome_to_json(outcome: lsmsg_core::WebhookOutcome) -> String {
+    match outcome {
+        lsmsg_core::WebhookOutcome::Rejected {
+            status_code,
+            message,
+        } => serde_json::json!({
+            "type": "rejected",
+            "status_code": status_code,
+            "error": message,
+        })
+        .to_string(),
+        lsmsg_core::WebhookOutcome::Challenge(challenge) => {
+            serde_json::json!({ "type": "challenge", "challenge": challenge }).to_string()
+        }
+        lsmsg_core::WebhookOutcome::Ignored => serde_json::json!({ "type": "ignored" }).to_string(),
+        lsmsg_core::WebhookOutcome::Dispatch(plan) => serde_json::json!({
+            "type": "dispatch",
+            "event": serde_json::to_value(&plan.event).unwrap_or(Value::Null),
+            "handler_ids": plan.handler_ids,
+        })
+        .to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slack
 // ---------------------------------------------------------------------------
@@ -289,115 +313,96 @@ pub extern "C" fn lsmsg_registry_match_event(
     to_c_string(&val.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// LangGraph Client (opaque handle)
-// ---------------------------------------------------------------------------
-
-static CLIENTS: Mutex<Vec<Option<lsmsg_core::LangGraphClient>>> = Mutex::new(Vec::new());
-
-/// Create a LangGraph client. Returns handle (>= 0) or -1 on error.
+/// Process a Slack webhook against a registry and return a JSON outcome.
+///
+/// # Safety
+///
+/// `content_type`, `signing_secret`, `timestamp`, and `signature` must be valid
+/// NUL-terminated strings when non-null. `body` must point to `body_len`
+/// readable bytes when non-null.
 #[no_mangle]
-pub extern "C" fn lsmsg_langgraph_new(base_url: *const c_char, api_key: *const c_char) -> i64 {
-    let url = from_c_str(base_url).unwrap_or_default();
-    let key = from_c_str(api_key);
-    let client = lsmsg_core::LangGraphClient::new(&url, key.as_deref());
-    let mut clients = CLIENTS.lock().unwrap();
-    let idx = clients.len();
-    clients.push(Some(client));
-    idx as i64
-}
-
-/// Free a LangGraph client.
-#[no_mangle]
-pub extern "C" fn lsmsg_langgraph_free(handle: i64) {
-    let mut clients = CLIENTS.lock().unwrap();
-    if let Some(slot) = clients.get_mut(handle as usize) {
-        *slot = None;
-    }
-}
-
-/// Create a run. params_json has { agent|assistant_id, thread_id, input?, config?, metadata? }.
-/// Returns run_id string or error JSON. Caller must free.
-#[no_mangle]
-pub extern "C" fn lsmsg_langgraph_create_run(
+pub unsafe extern "C" fn lsmsg_registry_process_slack_webhook(
     handle: i64,
-    params_json: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    content_type: *const c_char,
+    signing_secret: *const c_char,
+    timestamp: *const c_char,
+    signature: *const c_char,
 ) -> *mut c_char {
-    let json_str = from_c_str(params_json).unwrap_or_default();
-    let params: Value = serde_json::from_str(&json_str).unwrap_or(Value::Null);
+    let ct = from_c_str(content_type).unwrap_or_else(|| "application/json".into());
+    let secret = from_c_str(signing_secret);
+    let ts = from_c_str(timestamp);
+    let sig = from_c_str(signature);
 
-    let clients = CLIENTS.lock().unwrap();
-    let client = match clients.get(handle as usize).and_then(|s| s.as_ref()) {
-        Some(c) => c,
-        None => return to_c_string(r#"{"error":"invalid handle"}"#),
-    };
-
-    let create_params = lsmsg_core::CreateRunParams {
-        agent: params
-            .get("agent")
-            .or_else(|| params.get("assistant_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        thread_id: params
-            .get("thread_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        input: params.get("input").cloned(),
-        config: params.get("config").cloned(),
-        metadata: params.get("metadata").cloned(),
-    };
-
-    match client.create_run(&create_params) {
-        Ok(id) => to_c_string(&serde_json::json!({"run_id": id}).to_string()),
-        Err(e) => to_c_string(&serde_json::json!({"error": e.to_string()}).to_string()),
+    if body.is_null() {
+        return to_c_string(&webhook_outcome_to_json(
+            lsmsg_core::WebhookOutcome::Rejected {
+                status_code: 400,
+                message: "empty body".into(),
+            },
+        ));
     }
-}
+    let body_slice = unsafe { std::slice::from_raw_parts(body, body_len) };
 
-/// Wait for a run. Returns result JSON. Caller must free.
-#[no_mangle]
-pub extern "C" fn lsmsg_langgraph_wait_run(
-    handle: i64,
-    thread_id: *const c_char,
-    run_id: *const c_char,
-) -> *mut c_char {
-    let tid = from_c_str(thread_id).unwrap_or_default();
-    let rid = from_c_str(run_id).unwrap_or_default();
-
-    let clients = CLIENTS.lock().unwrap();
-    let client = match clients.get(handle as usize).and_then(|s| s.as_ref()) {
-        Some(c) => c,
-        None => return to_c_string(r#"{"error":"invalid handle"}"#),
-    };
-
-    match client.wait_run(&tid, &rid) {
-        Ok(result) => {
-            let val = serde_json::to_value(&result).unwrap_or(Value::Null);
-            to_c_string(&val.to_string())
+    let regs = REGISTRIES.lock().unwrap();
+    let reg = match regs.get(handle as usize).and_then(|s| s.as_ref()) {
+        Some(r) => r,
+        None => {
+            return to_c_string(&webhook_outcome_to_json(
+                lsmsg_core::WebhookOutcome::Rejected {
+                    status_code: 500,
+                    message: "invalid registry handle".into(),
+                },
+            ))
         }
-        Err(e) => to_c_string(&serde_json::json!({"error": e.to_string()}).to_string()),
-    }
-}
-
-/// Cancel a run. Returns "ok" or error JSON. Caller must free.
-#[no_mangle]
-pub extern "C" fn lsmsg_langgraph_cancel_run(
-    handle: i64,
-    thread_id: *const c_char,
-    run_id: *const c_char,
-) -> *mut c_char {
-    let tid = from_c_str(thread_id).unwrap_or_default();
-    let rid = from_c_str(run_id).unwrap_or_default();
-
-    let clients = CLIENTS.lock().unwrap();
-    let client = match clients.get(handle as usize).and_then(|s| s.as_ref()) {
-        Some(c) => c,
-        None => return to_c_string(r#"{"error":"invalid handle"}"#),
     };
 
-    match client.cancel_run(&tid, &rid) {
-        Ok(()) => to_c_string("ok"),
-        Err(e) => to_c_string(&serde_json::json!({"error": e.to_string()}).to_string()),
+    let outcome = lsmsg_core::process_slack_webhook(
+        body_slice,
+        &ct,
+        secret.as_deref(),
+        ts.as_deref(),
+        sig.as_deref(),
+        reg,
+    );
+    to_c_string(&webhook_outcome_to_json(outcome))
+}
+
+/// Process a Teams webhook against a registry and return a JSON outcome.
+///
+/// # Safety
+///
+/// `body` must point to `body_len` readable bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn lsmsg_registry_process_teams_webhook(
+    handle: i64,
+    body: *const u8,
+    body_len: usize,
+) -> *mut c_char {
+    if body.is_null() {
+        return to_c_string(&webhook_outcome_to_json(
+            lsmsg_core::WebhookOutcome::Rejected {
+                status_code: 400,
+                message: "empty body".into(),
+            },
+        ));
     }
+    let body_slice = unsafe { std::slice::from_raw_parts(body, body_len) };
+
+    let regs = REGISTRIES.lock().unwrap();
+    let reg = match regs.get(handle as usize).and_then(|s| s.as_ref()) {
+        Some(r) => r,
+        None => {
+            return to_c_string(&webhook_outcome_to_json(
+                lsmsg_core::WebhookOutcome::Rejected {
+                    status_code: 500,
+                    message: "invalid registry handle".into(),
+                },
+            ))
+        }
+    };
+
+    let outcome = lsmsg_core::process_teams_webhook(body_slice, reg);
+    to_c_string(&webhook_outcome_to_json(outcome))
 }

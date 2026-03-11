@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -72,26 +72,15 @@ type LangGraphConfig struct {
 	APIKey string
 }
 
-// handlerEntry stores a registered handler along with its filter.
-type handlerEntry struct {
-	id           int64
-	kind         EventKind
-	command      string
-	emoji        string
-	platform     Platform
-	rawEventType string
-	pattern      *regexp.Regexp
-	handler      EventHandler
-}
-
 // Bot is the main entry point for handling messaging platform webhooks.
 // It implements http.Handler.
 type Bot struct {
-	config   BotConfig
-	ffi      ffiBackend
-	mu       sync.RWMutex
-	handlers []handlerEntry
-	nextID   int64
+	config         BotConfig
+	ffi            ffiBackend
+	mu             sync.RWMutex
+	handlers       map[int64]EventHandler
+	registryHandle int64
+	closed         bool
 
 	// lgHandle is the FFI handle for the LangGraph client. Handle 0 is valid.
 	lgHandle int64
@@ -123,10 +112,15 @@ func newBotWithBackend(config BotConfig, backend ffiBackend) *Bot {
 	if config.MaxPendingTasks == 0 {
 		config.MaxPendingTasks = 100
 	}
+	registryHandle := backend.RegistryNew()
+	if registryHandle < 0 {
+		panic("lsmsg: failed to create handler registry")
+	}
 	b := &Bot{
 		config:              config,
 		ffi:                 backend,
-		nextID:              1,
+		handlers:            make(map[int64]EventHandler),
+		registryHandle:      registryHandle,
 		langGraphConfigured: config.LangGraph != nil,
 		httpClient:          http.DefaultClient,
 		slackAPIBaseURL:     "https://slack.com",
@@ -134,144 +128,159 @@ func newBotWithBackend(config BotConfig, backend ffiBackend) *Bot {
 	if config.LangGraph != nil {
 		b.lgHandle = b.ffi.LangGraphNew(config.LangGraph.URL, config.LangGraph.APIKey)
 	}
+	runtime.SetFinalizer(b, (*Bot).Close)
 	return b
 }
 
-func (b *Bot) register(kind EventKind, command, emoji string, platform Platform, rawEventType string, pattern *regexp.Regexp, handler EventHandler) {
+// Close releases native resources owned by the bot. It is safe to call multiple times.
+func (b *Bot) Close() {
+	runtime.SetFinalizer(b, nil)
+
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.closed = true
+	registryHandle := b.registryHandle
+	lgHandle := b.lgHandle
+	freeLangGraph := b.langGraphConfigured
+	b.mu.Unlock()
+
+	b.ffi.RegistryFree(registryHandle)
+	if freeLangGraph {
+		b.ffi.LangGraphFree(lgHandle)
+	}
+}
+
+func (b *Bot) register(kind EventKind, command, emoji string, platform Platform, rawEventType string, pattern string, handler EventHandler) {
+	fields := map[string]string{}
+	if kind != "" {
+		fields["event_kind"] = string(kind)
+	}
+	if command != "" {
+		fields["command"] = command
+	}
+	if emoji != "" {
+		fields["emoji"] = emoji
+	}
+	if platform != "" {
+		fields["platform"] = string(platform)
+	}
+	if rawEventType != "" {
+		fields["raw_event_type"] = rawEventType
+	}
+	if pattern != "" {
+		fields["pattern"] = pattern
+	}
+
+	fieldsJSON, err := json.Marshal(fields)
+	if err != nil {
+		panic(fmt.Sprintf("lsmsg: failed to marshal handler filter: %v", err))
+	}
+	id := b.ffi.RegistryRegister(b.registryHandle, fieldsJSON)
+	if id < 0 {
+		panic("lsmsg: failed to register handler filter")
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	id := b.nextID
-	b.nextID++
-	b.handlers = append(b.handlers, handlerEntry{
-		id:           id,
-		kind:         kind,
-		command:      command,
-		emoji:        emoji,
-		platform:     platform,
-		rawEventType: rawEventType,
-		pattern:      pattern,
-		handler:      handler,
-	})
+	b.handlers[id] = handler
 }
 
 // OnMention registers a handler for mention events.
 func (b *Bot) OnMention(handler EventHandler) {
-	b.register(EventMention, "", "", "", "", nil, handler)
+	b.register(EventMention, "", "", "", "", "", handler)
 }
 
 // OnMentionWithOpts registers a mention handler with additional filters.
 func (b *Bot) OnMentionWithOpts(handler EventHandler, opts HandlerOpts) {
-	var pat *regexp.Regexp
-	if opts.Pattern != "" {
-		pat = regexp.MustCompile(opts.Pattern)
-	}
-	b.register(EventMention, "", "", opts.Platform, "", pat, handler)
+	b.register(EventMention, "", "", opts.Platform, "", opts.Pattern, handler)
 }
 
 // OnMessage registers a handler for message events.
 func (b *Bot) OnMessage(handler EventHandler) {
-	b.register(EventMessage, "", "", "", "", nil, handler)
+	b.register(EventMessage, "", "", "", "", "", handler)
 }
 
 // OnMessageWithOpts registers a message handler with additional filters.
 func (b *Bot) OnMessageWithOpts(handler EventHandler, opts HandlerOpts) {
-	var pat *regexp.Regexp
-	if opts.Pattern != "" {
-		pat = regexp.MustCompile(opts.Pattern)
-	}
-	b.register(EventMessage, "", "", opts.Platform, "", pat, handler)
+	b.register(EventMessage, "", "", opts.Platform, "", opts.Pattern, handler)
 }
 
 // Command registers a handler for a slash command.
 func (b *Bot) Command(name string, handler EventHandler) {
-	b.register(EventCommand, name, "", "", "", nil, handler)
+	b.register(EventCommand, name, "", "", "", "", handler)
 }
 
 // CommandWithOpts registers a command handler with additional filters.
 func (b *Bot) CommandWithOpts(name string, handler EventHandler, opts HandlerOpts) {
-	var pat *regexp.Regexp
-	if opts.Pattern != "" {
-		pat = regexp.MustCompile(opts.Pattern)
-	}
-	b.register(EventCommand, name, "", opts.Platform, "", pat, handler)
+	b.register(EventCommand, name, "", opts.Platform, "", opts.Pattern, handler)
 }
 
 // OnReaction registers a handler for a specific emoji reaction.
 func (b *Bot) OnReaction(emoji string, handler EventHandler) {
-	b.register(EventReaction, "", emoji, "", "", nil, handler)
+	b.register(EventReaction, "", emoji, "", "", "", handler)
 }
 
 // OnReactionWithOpts registers a reaction handler with additional filters.
 func (b *Bot) OnReactionWithOpts(emoji string, handler EventHandler, opts HandlerOpts) {
-	var pat *regexp.Regexp
-	if opts.Pattern != "" {
-		pat = regexp.MustCompile(opts.Pattern)
-	}
-	b.register(EventReaction, "", emoji, opts.Platform, "", pat, handler)
+	b.register(EventReaction, "", emoji, opts.Platform, "", opts.Pattern, handler)
 }
 
 // On registers a handler for a raw event type.
 func (b *Bot) On(eventType string, handler EventHandler) {
-	b.register(EventRaw, "", "", "", eventType, nil, handler)
+	b.register(EventRaw, "", "", "", eventType, "", handler)
 }
 
 // OnWithOpts registers a raw event handler with additional filters.
 func (b *Bot) OnWithOpts(eventType string, handler EventHandler, opts HandlerOpts) {
-	var pat *regexp.Regexp
-	if opts.Pattern != "" {
-		pat = regexp.MustCompile(opts.Pattern)
-	}
-	b.register(EventRaw, "", "", opts.Platform, eventType, pat, handler)
+	b.register(EventRaw, "", "", opts.Platform, eventType, opts.Pattern, handler)
 }
 
-// matchHandlers returns all handlers matching the given event.
-func (b *Bot) matchHandlers(event *Event) []handlerEntry {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+func (b *Bot) matchHandlerIDs(event *Event) ([]int64, error) {
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return nil, fmt.Errorf("lsmsg: failed to marshal event: %w", err)
+	}
+	ids, err := b.ffi.RegistryMatchEvent(b.registryHandle, eventJSON)
+	if err != nil {
+		return nil, fmt.Errorf("lsmsg: failed to match event: %w", err)
+	}
+	return ids, nil
+}
 
-	var matched []handlerEntry
-	for _, h := range b.handlers {
-		if !handlerMatches(&h, event) {
+func (b *Bot) dispatchMatched(event *Event, handlerIDs []int64) error {
+	event.bot = b
+
+	b.mu.RLock()
+	callbacks := make([]EventHandler, 0, len(handlerIDs))
+	var errs []error
+	for _, id := range handlerIDs {
+		handler, ok := b.handlers[id]
+		if !ok {
+			errs = append(errs, fmt.Errorf("lsmsg: handler %d not found", id))
 			continue
 		}
-		matched = append(matched, h)
+		callbacks = append(callbacks, handler)
 	}
-	return matched
-}
+	b.mu.RUnlock()
 
-func handlerMatches(h *handlerEntry, event *Event) bool {
-	if h.kind != "" && h.kind != event.Kind {
-		return false
-	}
-	if h.platform != "" && h.platform != event.Platform.Name {
-		return false
-	}
-	if h.command != "" && h.command != event.Command {
-		return false
-	}
-	if h.emoji != "" && h.emoji != event.Emoji {
-		return false
-	}
-	if h.rawEventType != "" && h.rawEventType != event.RawEventType {
-		return false
-	}
-	if h.pattern != nil && !h.pattern.MatchString(event.Text) {
-		return false
-	}
-	return true
-}
-
-// dispatch runs all matching handlers for an event.
-func (b *Bot) dispatch(event *Event) error {
-	event.bot = b
-	handlers := b.matchHandlers(event)
-	var errs []error
-	for _, h := range handlers {
-		if err := h.handler(event); err != nil {
+	for _, handler := range callbacks {
+		if err := handler(event); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// dispatch runs all matching handlers for an event.
+func (b *Bot) dispatch(event *Event) error {
+	handlerIDs, err := b.matchHandlerIDs(event)
+	if err != nil {
+		return err
+	}
+	return b.dispatchMatched(event, handlerIDs)
 }
 
 // ServeHTTP implements http.Handler. It routes requests to the appropriate
@@ -298,6 +307,39 @@ func (b *Bot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (b *Bot) writeWebhookOutcome(ctx context.Context, w http.ResponseWriter, outcome *webhookOutcome) {
+	if outcome == nil {
+		http.Error(w, "failed to process webhook", http.StatusInternalServerError)
+		return
+	}
+
+	switch outcome.Type {
+	case "rejected":
+		statusCode := outcome.StatusCode
+		if statusCode == 0 {
+			statusCode = http.StatusBadRequest
+		}
+		message := outcome.Error
+		if message == "" {
+			message = http.StatusText(statusCode)
+		}
+		http.Error(w, message, statusCode)
+	case "challenge":
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": outcome.Challenge})
+	case "ignored":
+		w.WriteHeader(http.StatusOK)
+	case "dispatch":
+		if outcome.Event == nil {
+			http.Error(w, "failed to process webhook", http.StatusInternalServerError)
+			return
+		}
+		b.dispatchAsync(ctx, outcome.Event, outcome.HandlerIDs, w)
+	default:
+		http.Error(w, "failed to process webhook", http.StatusInternalServerError)
+	}
+}
+
 // HandleSlackWebhook handles an incoming Slack webhook HTTP request.
 func (b *Bot) HandleSlackWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -309,36 +351,23 @@ func (b *Bot) HandleSlackWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Verify signature if configured.
-	if b.config.Slack != nil && b.config.Slack.SigningSecret != "" {
-		ts := r.Header.Get("X-Slack-Request-Timestamp")
-		sig := r.Header.Get("X-Slack-Signature")
-		if !b.ffi.SlackVerifySignature(b.config.Slack.SigningSecret, ts, sig, body) {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
+	signingSecret := ""
+	if b.config.Slack != nil {
+		signingSecret = b.config.Slack.SigningSecret
 	}
-
-	event, challenge, err := b.ffi.SlackParseWebhook(body, r.Header.Get("Content-Type"))
+	outcome, err := b.ffi.RegistryProcessSlackWebhook(
+		b.registryHandle,
+		body,
+		r.Header.Get("Content-Type"),
+		signingSecret,
+		r.Header.Get("X-Slack-Request-Timestamp"),
+		r.Header.Get("X-Slack-Signature"),
+	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "failed to process webhook", http.StatusInternalServerError)
 		return
 	}
-
-	// URL verification challenge.
-	if challenge != "" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"challenge": challenge})
-		return
-	}
-
-	// Ignored event.
-	if event == nil {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	b.dispatchAsync(ctx, event, w)
+	b.writeWebhookOutcome(ctx, w, outcome)
 }
 
 // HandleTeamsWebhook handles an incoming Teams webhook HTTP request.
@@ -352,23 +381,17 @@ func (b *Bot) HandleTeamsWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	event, err := b.ffi.TeamsParseWebhook(body)
+	outcome, err := b.ffi.RegistryProcessTeamsWebhook(b.registryHandle, body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "failed to process webhook", http.StatusInternalServerError)
 		return
 	}
-
-	if event == nil {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	b.dispatchAsync(ctx, event, w)
+	b.writeWebhookOutcome(ctx, w, outcome)
 }
 
-func (b *Bot) dispatchAsync(_ context.Context, event *Event, w http.ResponseWriter) {
+func (b *Bot) dispatchAsync(_ context.Context, event *Event, handlerIDs []int64, w http.ResponseWriter) {
 	// Acknowledge immediately, dispatch in background.
-	if err := b.dispatch(event); err != nil {
+	if err := b.dispatchMatched(event, handlerIDs); err != nil {
 		// Log but still return 200 to the platform.
 		_ = err
 	}

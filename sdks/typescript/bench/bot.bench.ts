@@ -37,6 +37,20 @@ class HandlerRegistry {
   matchEvent(): number[] {
     return matchedIds;
   }
+
+  processSlackWebhook(
+    _body: Buffer,
+    _contentType: string,
+    _signingSecret: string,
+    _timestamp: string,
+    _signature: string,
+  ): Record<string, unknown> {
+    return { type: 'dispatch', event: slackEvent, handler_ids: matchedIds };
+  }
+
+  processTeamsWebhook(): Record<string, unknown> {
+    return { type: 'ignored' };
+  }
 }
 
 class LangGraphClient {

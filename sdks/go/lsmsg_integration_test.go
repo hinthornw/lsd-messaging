@@ -3,6 +3,9 @@
 package lsmsg
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +83,71 @@ func TestFFITeamsParseWebhook(t *testing.T) {
 	}
 	if event.Text != "hello teams" {
 		t.Fatalf("expected text to round-trip, got %q", event.Text)
+	}
+}
+
+func TestFFIBotSlackWebhookDispatchesMentionHandler(t *testing.T) {
+	bot := NewBot(BotConfig{})
+
+	var dispatched bool
+	bot.OnMention(func(e *Event) error {
+		dispatched = true
+		if e.Text != "hello" {
+			t.Fatalf("expected mention text to be normalized, got %q", e.Text)
+		}
+		if e.Platform.Name != PlatformSlack {
+			t.Fatalf("expected slack platform, got %s", e.Platform.Name)
+		}
+		return nil
+	})
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/slack/events",
+		strings.NewReader(`{"type":"event_callback","team_id":"T1","event":{"type":"app_mention","text":"<@U1> hello","channel":"C1","ts":"123.456","user":"U1"}}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	bot.HandleSlackWebhook(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !dispatched {
+		t.Fatal("expected slack mention handler to be dispatched")
+	}
+}
+
+func TestFFIBotTeamsWebhookDispatchesMessageHandler(t *testing.T) {
+	bot := NewBot(BotConfig{})
+
+	var dispatched bool
+	bot.OnMessageWithOpts(func(e *Event) error {
+		dispatched = true
+		if e.Text != "hello teams" {
+			t.Fatalf("expected teams text to round-trip, got %q", e.Text)
+		}
+		if e.Platform.Name != PlatformTeams {
+			t.Fatalf("expected teams platform, got %s", e.Platform.Name)
+		}
+		return nil
+	}, HandlerOpts{Platform: PlatformTeams})
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/teams/events",
+		strings.NewReader(`{"type":"message","text":"hello teams","from":{"id":"U1","name":"Alice"},"conversation":{"id":"conv-1","tenantId":"tenant-1"},"channelData":{"tenant":{"id":"tenant-1"},"team":{"id":"team-1"}},"id":"msg-1"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	bot.HandleTeamsWebhook(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !dispatched {
+		t.Fatal("expected teams handler to be dispatched")
 	}
 }

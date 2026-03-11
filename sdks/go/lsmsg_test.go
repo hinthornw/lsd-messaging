@@ -5,23 +5,40 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
 
 // mockBackend implements ffiBackend for unit testing without the Rust shared library.
+type registeredFilter struct {
+	ID     int64
+	Fields map[string]any
+}
+
 type mockBackend struct {
 	verifyResult       bool
 	langGraphHandle    int64
 	langGraphHandleSet bool
+	registryHandle     int64
+	registryHandleSet  bool
+	registeredFilters  []registeredFilter
+	nextHandlerID      int64
 	parseSlackFn       func(body []byte, contentType string) (*Event, string, error)
 	parseTeamsFn       func(payloadJSON []byte) (*Event, error)
 	stripSlackFn       func(text string) string
 	stripTeamsFn       func(text string) string
 	threadIDFn         func(platform, workspaceID, channelID, threadID string) string
+	registryNewFn      func() int64
+	registryRegisterFn func(handle int64, fieldsJSON []byte) int64
+	registryMatchFn    func(handle int64, eventJSON []byte) ([]int64, error)
+	processSlackFn     func(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error)
+	processTeamsFn     func(handle int64, body []byte) (*webhookOutcome, error)
 	createRunFn        func(handle int64, paramsJSON []byte) (string, error)
 	waitRunFn          func(handle int64, threadID, runID string) (*RunResult, error)
 	cancelRunFn        func(handle int64, threadID, runID string) error
+	freedRegistry      []int64
+	freedLangGraph     []int64
 }
 
 func (m *mockBackend) SlackVerifySignature(_, _, _ string, _ []byte) bool {
@@ -63,11 +80,153 @@ func (m *mockBackend) DeterministicThreadID(platform, workspaceID, channelID, th
 	return platform + ":" + workspaceID + ":" + channelID + ":" + threadID
 }
 
-func (m *mockBackend) RegistryNew() int64                       { return 1 }
-func (m *mockBackend) RegistryFree(_ int64)                     {}
-func (m *mockBackend) RegistryRegister(_ int64, _ []byte) int64 { return 1 }
-func (m *mockBackend) RegistryMatchEvent(_ int64, _ []byte) ([]int64, error) {
-	return nil, nil
+func (m *mockBackend) RegistryNew() int64 {
+	if m.registryNewFn != nil {
+		return m.registryNewFn()
+	}
+	if m.registryHandleSet {
+		return m.registryHandle
+	}
+	return 0
+}
+
+func (m *mockBackend) RegistryFree(handle int64) {
+	m.freedRegistry = append(m.freedRegistry, handle)
+}
+
+func (m *mockBackend) RegistryRegister(handle int64, fieldsJSON []byte) int64 {
+	if m.registryRegisterFn != nil {
+		return m.registryRegisterFn(handle, fieldsJSON)
+	}
+
+	var fields map[string]any
+	if err := json.Unmarshal(fieldsJSON, &fields); err != nil {
+		return -1
+	}
+	m.nextHandlerID++
+	id := m.nextHandlerID
+	m.registeredFilters = append(m.registeredFilters, registeredFilter{
+		ID:     id,
+		Fields: fields,
+	})
+	return id
+}
+
+func (m *mockBackend) RegistryMatchEvent(handle int64, eventJSON []byte) ([]int64, error) {
+	if m.registryMatchFn != nil {
+		return m.registryMatchFn(handle, eventJSON)
+	}
+
+	var event Event
+	if err := json.Unmarshal(eventJSON, &event); err != nil {
+		return nil, err
+	}
+
+	var matched []int64
+	for _, filter := range m.registeredFilters {
+		if matchesRegisteredFilter(filter.Fields, &event) {
+			matched = append(matched, filter.ID)
+		}
+	}
+	return matched, nil
+}
+
+func (m *mockBackend) RegistryProcessSlackWebhook(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error) {
+	if m.processSlackFn != nil {
+		return m.processSlackFn(handle, body, contentType, signingSecret, timestamp, signature)
+	}
+
+	if signingSecret != "" {
+		if timestamp == "" || signature == "" {
+			return &webhookOutcome{
+				Type:       "rejected",
+				StatusCode: http.StatusUnauthorized,
+				Error:      "missing signature headers",
+			}, nil
+		}
+		if !m.verifyResult {
+			return &webhookOutcome{
+				Type:       "rejected",
+				StatusCode: http.StatusUnauthorized,
+				Error:      "invalid signature",
+			}, nil
+		}
+	}
+
+	if m.parseSlackFn == nil {
+		return &webhookOutcome{Type: "ignored"}, nil
+	}
+
+	event, challenge, err := m.parseSlackFn(body, contentType)
+	if err != nil {
+		return &webhookOutcome{
+			Type:       "rejected",
+			StatusCode: http.StatusBadRequest,
+			Error:      err.Error(),
+		}, nil
+	}
+	if challenge != "" {
+		return &webhookOutcome{Type: "challenge", Challenge: challenge}, nil
+	}
+	if event == nil {
+		return &webhookOutcome{Type: "ignored"}, nil
+	}
+
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+	handlerIDs, err := m.RegistryMatchEvent(handle, eventJSON)
+	if err != nil {
+		return nil, err
+	}
+	if len(handlerIDs) == 0 {
+		return &webhookOutcome{Type: "ignored"}, nil
+	}
+	return &webhookOutcome{
+		Type:       "dispatch",
+		Event:      event,
+		HandlerIDs: handlerIDs,
+	}, nil
+}
+
+func (m *mockBackend) RegistryProcessTeamsWebhook(handle int64, body []byte) (*webhookOutcome, error) {
+	if m.processTeamsFn != nil {
+		return m.processTeamsFn(handle, body)
+	}
+
+	if m.parseTeamsFn == nil {
+		return &webhookOutcome{Type: "ignored"}, nil
+	}
+
+	event, err := m.parseTeamsFn(body)
+	if err != nil {
+		return &webhookOutcome{
+			Type:       "rejected",
+			StatusCode: http.StatusBadRequest,
+			Error:      err.Error(),
+		}, nil
+	}
+	if event == nil {
+		return &webhookOutcome{Type: "ignored"}, nil
+	}
+
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+	handlerIDs, err := m.RegistryMatchEvent(handle, eventJSON)
+	if err != nil {
+		return nil, err
+	}
+	if len(handlerIDs) == 0 {
+		return &webhookOutcome{Type: "ignored"}, nil
+	}
+	return &webhookOutcome{
+		Type:       "dispatch",
+		Event:      event,
+		HandlerIDs: handlerIDs,
+	}, nil
 }
 
 func (m *mockBackend) LangGraphNew(_, _ string) int64 {
@@ -77,7 +236,34 @@ func (m *mockBackend) LangGraphNew(_, _ string) int64 {
 	return 1
 }
 
-func (m *mockBackend) LangGraphFree(_ int64) {}
+func (m *mockBackend) LangGraphFree(handle int64) {
+	m.freedLangGraph = append(m.freedLangGraph, handle)
+}
+
+func matchesRegisteredFilter(fields map[string]any, event *Event) bool {
+	if eventKind, ok := fields["event_kind"].(string); ok && eventKind != "" && string(event.Kind) != eventKind {
+		return false
+	}
+	if platform, ok := fields["platform"].(string); ok && platform != "" && string(event.Platform.Name) != platform {
+		return false
+	}
+	if command, ok := fields["command"].(string); ok && command != "" && event.Command != command {
+		return false
+	}
+	if emoji, ok := fields["emoji"].(string); ok && emoji != "" && event.Emoji != emoji {
+		return false
+	}
+	if rawEventType, ok := fields["raw_event_type"].(string); ok && rawEventType != "" && event.RawEventType != rawEventType {
+		return false
+	}
+	if pattern, ok := fields["pattern"].(string); ok && pattern != "" {
+		re, err := regexp.Compile(pattern)
+		if err != nil || !re.MatchString(event.Text) {
+			return false
+		}
+	}
+	return true
+}
 
 func (m *mockBackend) LangGraphCreateRun(handle int64, paramsJSON []byte) (string, error) {
 	if m.createRunFn != nil {
@@ -107,9 +293,10 @@ func (m *mockBackend) LangGraphCancelRun(handle int64, threadID, runID string) e
 // --- Tests ---
 
 func TestNewBot(t *testing.T) {
+	mock := &mockBackend{}
 	bot := newBotWithBackend(BotConfig{
 		Slack: &SlackConfig{SigningSecret: "secret"},
-	}, &mockBackend{})
+	}, mock)
 
 	if bot == nil {
 		t.Fatal("expected bot to be non-nil")
@@ -120,41 +307,66 @@ func TestNewBot(t *testing.T) {
 	if bot.config.MaxPendingTasks == 0 {
 		t.Error("expected default MaxPendingTasks")
 	}
+	if bot.registryHandle != 0 {
+		t.Errorf("expected zero registry handle to remain valid, got %d", bot.registryHandle)
+	}
+}
+
+func TestBotCloseReleasesNativeHandlesOnce(t *testing.T) {
+	mock := &mockBackend{
+		registryHandleSet:  true,
+		registryHandle:     0,
+		langGraphHandleSet: true,
+		langGraphHandle:    0,
+	}
+	bot := newBotWithBackend(BotConfig{
+		LangGraph: &LangGraphConfig{URL: "http://localhost:8123"},
+	}, mock)
+
+	bot.Close()
+	bot.Close()
+
+	if len(mock.freedRegistry) != 1 || mock.freedRegistry[0] != 0 {
+		t.Fatalf("expected registry handle 0 to be freed once, got %#v", mock.freedRegistry)
+	}
+	if len(mock.freedLangGraph) != 1 || mock.freedLangGraph[0] != 0 {
+		t.Fatalf("expected LangGraph handle 0 to be freed once, got %#v", mock.freedLangGraph)
+	}
 }
 
 func TestHandlerRegistration(t *testing.T) {
-	bot := newBotWithBackend(BotConfig{}, &mockBackend{})
+	mock := &mockBackend{}
+	bot := newBotWithBackend(BotConfig{}, mock)
 
-	var called []string
-
-	bot.OnMention(func(e *Event) error {
-		called = append(called, "mention")
-		return nil
-	})
-	bot.OnMessage(func(e *Event) error {
-		called = append(called, "message")
-		return nil
-	})
-	bot.Command("/ask", func(e *Event) error {
-		called = append(called, "command:/ask")
-		return nil
-	})
-	bot.OnReaction("thumbsup", func(e *Event) error {
-		called = append(called, "reaction:thumbsup")
-		return nil
-	})
-	bot.On("app_home_opened", func(e *Event) error {
-		called = append(called, "raw:app_home_opened")
-		return nil
-	})
+	bot.OnMention(func(e *Event) error { return nil })
+	bot.OnMessage(func(e *Event) error { return nil })
+	bot.Command("/ask", func(e *Event) error { return nil })
+	bot.OnReaction("thumbsup", func(e *Event) error { return nil })
+	bot.On("app_home_opened", func(e *Event) error { return nil })
 
 	if len(bot.handlers) != 5 {
 		t.Fatalf("expected 5 handlers, got %d", len(bot.handlers))
 	}
+	if len(mock.registeredFilters) != 5 {
+		t.Fatalf("expected 5 registered filters, got %d", len(mock.registeredFilters))
+	}
+	if got := mock.registeredFilters[0].Fields["event_kind"]; got != string(EventMention) {
+		t.Fatalf("expected first filter to register mention kind, got %v", got)
+	}
+	if got := mock.registeredFilters[2].Fields["command"]; got != "/ask" {
+		t.Fatalf("expected command filter to register /ask, got %v", got)
+	}
+	if got := mock.registeredFilters[3].Fields["emoji"]; got != "thumbsup" {
+		t.Fatalf("expected reaction filter to register thumbsup, got %v", got)
+	}
+	if got := mock.registeredFilters[4].Fields["raw_event_type"]; got != "app_home_opened" {
+		t.Fatalf("expected raw event type to be registered, got %v", got)
+	}
 }
 
-func TestHandlerMatching(t *testing.T) {
-	bot := newBotWithBackend(BotConfig{}, &mockBackend{})
+func TestDispatchUsesRegistryMatchResult(t *testing.T) {
+	mock := &mockBackend{}
+	bot := newBotWithBackend(BotConfig{}, mock)
 
 	var result string
 
@@ -176,36 +388,56 @@ func TestHandlerMatching(t *testing.T) {
 	})
 
 	tests := []struct {
-		name     string
-		event    Event
-		expected string
+		name      string
+		handlerID int64
+		event     Event
+		expected  string
 	}{
 		{
-			name:     "mention event",
-			event:    Event{Kind: EventMention, Platform: PlatformCapabilities{Name: PlatformSlack}},
-			expected: "mention",
+			name:      "mention event",
+			handlerID: mock.registeredFilters[0].ID,
+			event:     Event{Kind: EventMention, Platform: PlatformCapabilities{Name: PlatformSlack}},
+			expected:  "mention",
 		},
 		{
-			name:     "message event",
-			event:    Event{Kind: EventMessage, Platform: PlatformCapabilities{Name: PlatformSlack}},
-			expected: "message",
+			name:      "message event",
+			handlerID: mock.registeredFilters[1].ID,
+			event:     Event{Kind: EventMessage, Platform: PlatformCapabilities{Name: PlatformSlack}},
+			expected:  "message",
 		},
 		{
-			name:     "command event",
-			event:    Event{Kind: EventCommand, Command: "/ask", Platform: PlatformCapabilities{Name: PlatformSlack}},
-			expected: "command",
+			name:      "command event",
+			handlerID: mock.registeredFilters[2].ID,
+			event:     Event{Kind: EventCommand, Command: "/ask", Platform: PlatformCapabilities{Name: PlatformSlack}},
+			expected:  "command",
 		},
 		{
-			name:     "reaction event",
-			event:    Event{Kind: EventReaction, Emoji: "thumbsup", Platform: PlatformCapabilities{Name: PlatformSlack}},
-			expected: "reaction",
+			name:      "reaction event",
+			handlerID: mock.registeredFilters[3].ID,
+			event:     Event{Kind: EventReaction, Emoji: "thumbsup", Platform: PlatformCapabilities{Name: PlatformSlack}},
+			expected:  "reaction",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			mock.registryMatchFn = func(handle int64, eventJSON []byte) ([]int64, error) {
+				if handle != bot.registryHandle {
+					t.Fatalf("expected registry handle %d, got %d", bot.registryHandle, handle)
+				}
+				var event Event
+				if err := json.Unmarshal(eventJSON, &event); err != nil {
+					t.Fatalf("expected dispatch to marshal an event, got %v", err)
+				}
+				if event.Kind != tc.event.Kind {
+					t.Fatalf("expected event kind %s, got %s", tc.event.Kind, event.Kind)
+				}
+				return []int64{tc.handlerID}, nil
+			}
 			result = ""
-			bot.dispatch(&tc.event)
+			if err := bot.dispatch(&tc.event); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if result != tc.expected {
 				t.Errorf("expected %q, got %q", tc.expected, result)
 			}
@@ -213,71 +445,50 @@ func TestHandlerMatching(t *testing.T) {
 	}
 }
 
-func TestHandlerMatchingWithPlatformFilter(t *testing.T) {
-	bot := newBotWithBackend(BotConfig{}, &mockBackend{})
+func TestHandlerRegistrationIncludesPlatformFilter(t *testing.T) {
+	mock := &mockBackend{}
+	bot := newBotWithBackend(BotConfig{}, mock)
 
-	var result string
+	bot.OnMentionWithOpts(func(e *Event) error { return nil }, HandlerOpts{Platform: PlatformSlack})
+	bot.OnMentionWithOpts(func(e *Event) error { return nil }, HandlerOpts{Platform: PlatformTeams})
 
-	bot.OnMentionWithOpts(func(e *Event) error {
-		result = "slack-mention"
-		return nil
-	}, HandlerOpts{Platform: PlatformSlack})
-
-	bot.OnMentionWithOpts(func(e *Event) error {
-		result = "teams-mention"
-		return nil
-	}, HandlerOpts{Platform: PlatformTeams})
-
-	// Slack mention should only match the first handler.
-	result = ""
-	bot.dispatch(&Event{Kind: EventMention, Platform: PlatformCapabilities{Name: PlatformSlack}})
-	if result != "slack-mention" {
-		t.Errorf("expected slack-mention, got %q", result)
+	if got := mock.registeredFilters[0].Fields["platform"]; got != string(PlatformSlack) {
+		t.Fatalf("expected slack platform filter, got %v", got)
 	}
-
-	// Teams mention should only match the second handler.
-	result = ""
-	bot.dispatch(&Event{Kind: EventMention, Platform: PlatformCapabilities{Name: PlatformTeams}})
-	if result != "teams-mention" {
-		t.Errorf("expected teams-mention, got %q", result)
+	if got := mock.registeredFilters[1].Fields["platform"]; got != string(PlatformTeams) {
+		t.Fatalf("expected teams platform filter, got %v", got)
 	}
 }
 
-func TestHandlerMatchingWithPattern(t *testing.T) {
-	bot := newBotWithBackend(BotConfig{}, &mockBackend{})
+func TestHandlerRegistrationIncludesPatternFilter(t *testing.T) {
+	mock := &mockBackend{}
+	bot := newBotWithBackend(BotConfig{}, mock)
 
-	var result string
+	bot.OnMessageWithOpts(func(e *Event) error { return nil }, HandlerOpts{Pattern: `hello\s+world`})
 
-	bot.OnMessageWithOpts(func(e *Event) error {
-		result = "matched"
-		return nil
-	}, HandlerOpts{Pattern: `hello\s+world`})
-
-	result = ""
-	bot.dispatch(&Event{Kind: EventMessage, Text: "hello world", Platform: PlatformCapabilities{Name: PlatformSlack}})
-	if result != "matched" {
-		t.Errorf("expected matched, got %q", result)
+	if got := mock.registeredFilters[0].Fields["pattern"]; got != `hello\s+world` {
+		t.Fatalf("expected pattern filter to be registered, got %v", got)
 	}
+}
 
-	result = ""
-	bot.dispatch(&Event{Kind: EventMessage, Text: "goodbye", Platform: PlatformCapabilities{Name: PlatformSlack}})
-	if result != "" {
-		t.Errorf("expected empty, got %q", result)
+func TestHandlerRegistrationPanicsWhenRegistryRejectsFilter(t *testing.T) {
+	mock := &mockBackend{
+		registryRegisterFn: func(handle int64, fieldsJSON []byte) int64 { return -1 },
 	}
+	bot := newBotWithBackend(BotConfig{}, mock)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected invalid handler registration to panic")
+		}
+	}()
+
+	bot.OnMessageWithOpts(func(e *Event) error { return nil }, HandlerOpts{Pattern: "("})
 }
 
 func TestSlackWebhookHandler(t *testing.T) {
 	var dispatched bool
-	mock := &mockBackend{
-		verifyResult: true,
-		parseSlackFn: func(body []byte, contentType string) (*Event, string, error) {
-			return &Event{
-				Kind:     EventMention,
-				Platform: PlatformCapabilities{Name: PlatformSlack},
-				Text:     "hello",
-			}, "", nil
-		},
-	}
+	mock := &mockBackend{}
 
 	bot := newBotWithBackend(BotConfig{
 		Slack: &SlackConfig{SigningSecret: "secret"},
@@ -287,6 +498,31 @@ func TestSlackWebhookHandler(t *testing.T) {
 		dispatched = true
 		return nil
 	})
+
+	mentionID := mock.registeredFilters[0].ID
+	mock.processSlackFn = func(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error) {
+		if handle != bot.registryHandle {
+			t.Fatalf("expected registry handle %d, got %d", bot.registryHandle, handle)
+		}
+		if signingSecret != "secret" {
+			t.Fatalf("expected signing secret to be forwarded, got %q", signingSecret)
+		}
+		if timestamp != "1234567890" {
+			t.Fatalf("expected timestamp to be forwarded, got %q", timestamp)
+		}
+		if signature != "v0=abc" {
+			t.Fatalf("expected signature to be forwarded, got %q", signature)
+		}
+		return &webhookOutcome{
+			Type: "dispatch",
+			Event: &Event{
+				Kind:     EventMention,
+				Platform: PlatformCapabilities{Name: PlatformSlack},
+				Text:     "hello",
+			},
+			HandlerIDs: []int64{mentionID},
+		}, nil
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(`{"event":{"type":"app_mention"}}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -306,7 +542,13 @@ func TestSlackWebhookHandler(t *testing.T) {
 
 func TestSlackWebhookSignatureFailure(t *testing.T) {
 	mock := &mockBackend{
-		verifyResult: false,
+		processSlackFn: func(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error) {
+			return &webhookOutcome{
+				Type:       "rejected",
+				StatusCode: http.StatusUnauthorized,
+				Error:      "invalid signature",
+			}, nil
+		},
 	}
 
 	bot := newBotWithBackend(BotConfig{
@@ -328,9 +570,11 @@ func TestSlackWebhookSignatureFailure(t *testing.T) {
 
 func TestSlackURLVerificationChallenge(t *testing.T) {
 	mock := &mockBackend{
-		verifyResult: true,
-		parseSlackFn: func(body []byte, contentType string) (*Event, string, error) {
-			return nil, "challenge-token-123", nil
+		processSlackFn: func(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error) {
+			return &webhookOutcome{
+				Type:      "challenge",
+				Challenge: "challenge-token-123",
+			}, nil
 		},
 	}
 
@@ -359,15 +603,7 @@ func TestSlackURLVerificationChallenge(t *testing.T) {
 
 func TestTeamsWebhookHandler(t *testing.T) {
 	var dispatched bool
-	mock := &mockBackend{
-		parseTeamsFn: func(payloadJSON []byte) (*Event, error) {
-			return &Event{
-				Kind:     EventMessage,
-				Platform: PlatformCapabilities{Name: PlatformTeams},
-				Text:     "hello teams",
-			}, nil
-		},
-	}
+	mock := &mockBackend{}
 
 	bot := newBotWithBackend(BotConfig{
 		Teams: &TeamsConfig{AppID: "app-id"},
@@ -380,6 +616,22 @@ func TestTeamsWebhookHandler(t *testing.T) {
 		}
 		return nil
 	})
+
+	messageID := mock.registeredFilters[0].ID
+	mock.processTeamsFn = func(handle int64, body []byte) (*webhookOutcome, error) {
+		if handle != bot.registryHandle {
+			t.Fatalf("expected registry handle %d, got %d", bot.registryHandle, handle)
+		}
+		return &webhookOutcome{
+			Type: "dispatch",
+			Event: &Event{
+				Kind:     EventMessage,
+				Platform: PlatformCapabilities{Name: PlatformTeams},
+				Text:     "hello teams",
+			},
+			HandlerIDs: []int64{messageID},
+		}, nil
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/teams/events", strings.NewReader(`{"type":"message"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -657,7 +909,8 @@ func TestRunResultText(t *testing.T) {
 }
 
 func TestMultipleHandlersDispatched(t *testing.T) {
-	bot := newBotWithBackend(BotConfig{}, &mockBackend{})
+	mock := &mockBackend{}
+	bot := newBotWithBackend(BotConfig{}, mock)
 
 	var calls []string
 
@@ -670,8 +923,16 @@ func TestMultipleHandlersDispatched(t *testing.T) {
 		return nil
 	})
 
+	firstID := mock.registeredFilters[0].ID
+	secondID := mock.registeredFilters[1].ID
+	mock.registryMatchFn = func(handle int64, eventJSON []byte) ([]int64, error) {
+		return []int64{firstID, secondID}, nil
+	}
+
 	event := &Event{Kind: EventMention, Platform: PlatformCapabilities{Name: PlatformSlack}}
-	bot.dispatch(event)
+	if err := bot.dispatch(event); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 calls, got %d", len(calls))
@@ -682,7 +943,8 @@ func TestMultipleHandlersDispatched(t *testing.T) {
 }
 
 func TestNoMatchingHandler(t *testing.T) {
-	bot := newBotWithBackend(BotConfig{}, &mockBackend{})
+	mock := &mockBackend{}
+	bot := newBotWithBackend(BotConfig{}, mock)
 
 	bot.OnMention(func(e *Event) error {
 		t.Error("should not be called")
@@ -698,15 +960,7 @@ func TestNoMatchingHandler(t *testing.T) {
 
 func TestAutoDetectSlackByHeader(t *testing.T) {
 	var dispatched bool
-	mock := &mockBackend{
-		verifyResult: true,
-		parseSlackFn: func(body []byte, contentType string) (*Event, string, error) {
-			return &Event{
-				Kind:     EventMention,
-				Platform: PlatformCapabilities{Name: PlatformSlack},
-			}, "", nil
-		},
-	}
+	mock := &mockBackend{}
 
 	bot := newBotWithBackend(BotConfig{
 		Slack: &SlackConfig{SigningSecret: "secret"},
@@ -716,6 +970,18 @@ func TestAutoDetectSlackByHeader(t *testing.T) {
 		dispatched = true
 		return nil
 	})
+
+	mentionID := mock.registeredFilters[0].ID
+	mock.processSlackFn = func(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error) {
+		return &webhookOutcome{
+			Type: "dispatch",
+			Event: &Event{
+				Kind:     EventMention,
+				Platform: PlatformCapabilities{Name: PlatformSlack},
+			},
+			HandlerIDs: []int64{mentionID},
+		}, nil
+	}
 
 	// Send to a non-standard path but with Slack headers.
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(`{}`))

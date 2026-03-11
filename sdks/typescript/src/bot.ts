@@ -121,21 +121,10 @@ export class Bot {
   private readonly config: BotConfig;
   private readonly registry: InstanceType<typeof native.HandlerRegistry>;
   private readonly handlers: Map<number, RegisteredHandler> = new Map();
-  private langGraphClient:
-    | InstanceType<typeof native.LangGraphClient>
-    | undefined;
-
   constructor(config: BotConfig) {
     assertNativeAvailable();
     this.config = config;
     this.registry = new native.HandlerRegistry();
-
-    if (config.langGraph) {
-      this.langGraphClient = new native.LangGraphClient(
-        config.langGraph.url,
-        config.langGraph.apiKey,
-      );
-    }
   }
 
   // ---------------------------------------------------------------------------
@@ -216,24 +205,21 @@ export class Bot {
     const timestamp = (req.headers['x-slack-request-timestamp'] as string) ?? '';
     const signature = (req.headers['x-slack-signature'] as string) ?? '';
 
-    const valid = await deferSync(() =>
-      native.slackVerifySignature(
+    const contentType = (req.headers['content-type'] as string) ?? 'application/json';
+    const parsed = await deferSync(() =>
+      this.registry.processSlackWebhook(
+        Buffer.from(rawBody),
+        contentType,
         signingSecret,
         timestamp,
         signature,
-        Buffer.from(rawBody),
       ),
     );
 
-    if (!valid) {
-      res.status(401).json({ error: 'Invalid signature' });
+    if (parsed.type === 'rejected') {
+      res.status(parsed.status_code ?? 400).json({ error: parsed.error ?? 'Rejected' });
       return;
     }
-
-    const contentType = (req.headers['content-type'] as string) ?? 'application/json';
-    const parsed = await deferSync(() =>
-      native.slackParseWebhook(Buffer.from(rawBody), contentType),
-    );
 
     if (parsed.type === 'challenge') {
       res.status(200).json({ challenge: parsed.challenge });
@@ -249,25 +235,32 @@ export class Bot {
     res.status(200).json({ ok: true });
 
     const event = toEvent(parsed.event, this);
-    await this._dispatch(event);
+    await this._dispatch(event, parsed.handler_ids as number[] | undefined);
   }
 
   /**
    * Express-compatible request handler for Teams webhooks.
    */
   async handleTeamsWebhook(req: Request, res: Response): Promise<void> {
-    const body = req.body;
-    const parsed = await deferSync(() => native.teamsParseWebhook(body));
+    const body = await getRawBody(req as RawBodyRequest);
+    const parsed = await deferSync(() =>
+      this.registry.processTeamsWebhook(Buffer.from(body)),
+    );
 
-    if (!parsed) {
+    if (parsed.type === 'rejected') {
+      res.status(parsed.status_code ?? 400).json({ error: parsed.error ?? 'Rejected' });
+      return;
+    }
+
+    if (parsed.type === 'ignored' || !parsed.event) {
       res.status(200).json({ ok: true });
       return;
     }
 
     res.status(200).json({ ok: true });
 
-    const event = toEvent(parsed, this);
-    await this._dispatch(event);
+    const event = toEvent(parsed.event, this);
+    await this._dispatch(event, parsed.handler_ids as number[] | undefined);
   }
 
   /**
@@ -286,7 +279,12 @@ export class Bot {
         req.rawBody = Buffer.from(buf);
       },
     });
-    const teamsBodyParser = express.json();
+    const teamsBodyParser = express.raw({
+      type: () => true,
+      verify: (req: RawBodyRequest, _res: Response, buf: Buffer) => {
+        req.rawBody = Buffer.from(buf);
+      },
+    });
 
     router.post(`${base}/slack/events`, slackBodyParser, (req, res) => {
       this.handleSlackWebhook(req, res).catch((err) => {
@@ -323,75 +321,29 @@ export class Bot {
   }
 
   // ---------------------------------------------------------------------------
-  // Internal: LangGraph integration
+  // Internal: LangGraph integration (to be implemented with native fetch)
   // ---------------------------------------------------------------------------
 
   /** @internal */
   async _invoke(
-    event: Event,
-    agent: string,
-    options?: InvokeOptions,
+    _event: Event,
+    _agent: string,
+    _options?: InvokeOptions,
   ): Promise<RunResult> {
-    if (!this.langGraphClient) {
-      throw new Error('LangGraph client not configured. Provide langGraph in BotConfig.');
-    }
-    const client = this.langGraphClient;
-    const threadId = event.internalThreadId;
-    const input = options?.input ?? {
-      messages: [{ role: 'user', content: event.text }],
-    };
-
-    const runId = await deferSync(() =>
-      client.createRun(
-        agent,
-        threadId,
-        input,
-        options?.config ?? null,
-        options?.metadata ?? null,
-      ),
+    throw new Error(
+      'LangGraph client not yet implemented in TypeScript SDK. Use fetch directly.',
     );
-
-    const resultJson = await deferSync(() => client.waitRun(threadId, runId));
-    const result: RunResult = {
-      id: resultJson.id ?? runId,
-      status: resultJson.status ?? 'completed',
-      output: resultJson.output ?? resultJson,
-      text: extractText(resultJson),
-    };
-    return result;
   }
 
   /** @internal */
   async _stream(
-    event: Event,
-    agent: string,
-    options?: InvokeOptions,
+    _event: Event,
+    _agent: string,
+    _options?: InvokeOptions,
   ): Promise<RunChunk[]> {
-    if (!this.langGraphClient) {
-      throw new Error('LangGraph client not configured. Provide langGraph in BotConfig.');
-    }
-    const client = this.langGraphClient;
-    const threadId = event.internalThreadId;
-    const input = options?.input ?? {
-      messages: [{ role: 'user', content: event.text }],
-    };
-
-    const rawChunks = await deferSync(() =>
-      client.streamNewRun(
-        agent,
-        threadId,
-        input,
-        options?.config ?? null,
-        options?.metadata ?? null,
-      ),
+    throw new Error(
+      'LangGraph client not yet implemented in TypeScript SDK. Use fetch directly.',
     );
-
-    return (rawChunks as any[]).map((c: any) => ({
-      event: c.event ?? '',
-      text: c.text ?? '',
-      textDelta: c.text_delta ?? '',
-      data: c.data ?? {},
-    }));
   }
 
   /** @internal */
@@ -429,7 +381,7 @@ export class Bot {
   }
 
   /** @internal */
-  private async _dispatch(event: Event): Promise<void> {
+  private async _dispatch(event: Event, matchedIds?: number[]): Promise<void> {
     // Convert event back to snake_case JSON for the napi registry matcher
     const eventJson = {
       kind: event.kind,
@@ -454,12 +406,12 @@ export class Bot {
       raw: event.raw ?? null,
     };
 
-    const matchedIds: number[] = await deferSync(() =>
+    const resolvedIds = matchedIds ?? await deferSync(() =>
       this.registry.matchEvent(eventJson),
     );
 
     const promises: Promise<void>[] = [];
-    for (const id of matchedIds) {
+    for (const id of resolvedIds) {
       const registered = this.handlers.get(id);
       if (registered) {
         promises.push(

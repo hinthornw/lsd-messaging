@@ -22,10 +22,34 @@ type cgoBackend struct{}
 
 func cString(s string) *C.char { return C.CString(s) }
 
+func cOptionalString(s string) *C.char {
+	if s == "" {
+		return nil
+	}
+	return C.CString(s)
+}
+
+func freeCString(cs *C.char) {
+	if cs != nil {
+		C.free(unsafe.Pointer(cs))
+	}
+}
+
 func goStringFree(cs *C.char) string {
 	s := C.GoString(cs)
 	C.lsmsg_free_string(cs)
 	return s
+}
+
+func parseWebhookOutcome(jsonStr string) (*webhookOutcome, error) {
+	var outcome webhookOutcome
+	if err := json.Unmarshal([]byte(jsonStr), &outcome); err != nil {
+		return nil, fmt.Errorf("lsmsg: failed to parse webhook outcome: %w", err)
+	}
+	if outcome.Type == "" {
+		return nil, errors.New("lsmsg: webhook outcome missing type")
+	}
+	return &outcome, nil
 }
 
 func (cgoBackend) SlackVerifySignature(signingSecret, timestamp, signature string, body []byte) bool {
@@ -170,6 +194,49 @@ func (cgoBackend) RegistryMatchEvent(handle int64, eventJSON []byte) ([]int64, e
 		return nil, fmt.Errorf("lsmsg: failed to parse match result: %w", err)
 	}
 	return ids, nil
+}
+
+func (cgoBackend) RegistryProcessSlackWebhook(handle int64, body []byte, contentType, signingSecret, timestamp, signature string) (*webhookOutcome, error) {
+	var bodyPtr *C.uint8_t
+	if len(body) > 0 {
+		bodyPtr = (*C.uint8_t)(unsafe.Pointer(&body[0]))
+	}
+
+	cCT := cOptionalString(contentType)
+	defer freeCString(cCT)
+	cSecret := cOptionalString(signingSecret)
+	defer freeCString(cSecret)
+	cTs := cOptionalString(timestamp)
+	defer freeCString(cTs)
+	cSig := cOptionalString(signature)
+	defer freeCString(cSig)
+
+	result := C.lsmsg_registry_process_slack_webhook(
+		C.int64_t(handle),
+		bodyPtr,
+		C.size_t(len(body)),
+		cCT,
+		cSecret,
+		cTs,
+		cSig,
+	)
+	if result == nil {
+		return nil, errors.New("lsmsg: process_slack_webhook returned nil")
+	}
+	return parseWebhookOutcome(goStringFree(result))
+}
+
+func (cgoBackend) RegistryProcessTeamsWebhook(handle int64, body []byte) (*webhookOutcome, error) {
+	var bodyPtr *C.uint8_t
+	if len(body) > 0 {
+		bodyPtr = (*C.uint8_t)(unsafe.Pointer(&body[0]))
+	}
+
+	result := C.lsmsg_registry_process_teams_webhook(C.int64_t(handle), bodyPtr, C.size_t(len(body)))
+	if result == nil {
+		return nil, errors.New("lsmsg: process_teams_webhook returned nil")
+	}
+	return parseWebhookOutcome(goStringFree(result))
 }
 
 func (cgoBackend) LangGraphNew(baseURL, apiKey string) int64 {
