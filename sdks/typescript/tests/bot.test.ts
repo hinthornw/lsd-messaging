@@ -172,7 +172,7 @@ describe('Bot', () => {
     it('fails with an actionable error when native bindings are unavailable', () => {
       setNativeModule(undefined);
       expect(() => new Bot(makeConfig())).toThrow(
-        'lsmsg native bindings are unavailable',
+        'botmux native bindings are unavailable',
       );
       setNativeModule(mockNative);
     });

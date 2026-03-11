@@ -1,4 +1,4 @@
-"""Bot class: the main entry point for building messaging bots with lsmsg."""
+"""Bot class: the main entry point for building messaging bots with botmux."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from typing import Any, Callable, Coroutine, Optional, Sequence
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-from lsmsg._adapters import Adapter
-from lsmsg._context import Context
-from lsmsg._remote import LangGraph, Remote
-from lsmsg._types import Event
+from botmux._adapters import Adapter
+from botmux._context import Context
+from botmux._remote import LangGraph, Remote
+from botmux._types import Event
 
-logger = logging.getLogger("lsmsg")
+logger = logging.getLogger("botmux")
 
 HandlerFunc = Callable[[Context], Coroutine[Any, Any, Any]]
 
@@ -295,7 +295,7 @@ class Bot:
             self._app = self._build_app()
         await self._app(scope, receive, send)
 
-    def attach(self, app: Any, prefix: str = "/lsmsg") -> None:
+    def attach(self, app: Any, prefix: str = "/botmux") -> None:
         """Mount the bot's webhook routes onto an existing Starlette/FastAPI app."""
         sub_app = self._build_app("")
         app.mount(prefix, sub_app)

@@ -9,9 +9,9 @@ import time
 
 import pytest
 
-from lsmsg._adapters import Slack, Teams
-from lsmsg._bot import Bot
-from lsmsg._context import Context
+from botmux._adapters import Slack, Teams
+from botmux._bot import Bot
+from botmux._context import Context
 
 
 def make_slack_headers(
@@ -46,7 +46,7 @@ class TestBotCreation:
         assert bot._remote is None
 
     def test_default_remote_is_langgraph(self):
-        from lsmsg._remote import LangGraph
+        from botmux._remote import LangGraph
 
         bot = Bot()
         assert isinstance(bot._remote, LangGraph)
@@ -518,7 +518,7 @@ class TestASGI:
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
             resp = await client.post(
-                "/lsmsg/slack/events",
+                "/botmux/slack/events",
                 content=body,
                 headers=make_slack_headers(body),
             )

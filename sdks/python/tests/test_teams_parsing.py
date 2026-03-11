@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-from lsmsg._adapters import _parse_teams_webhook as _raw_parse
+from botmux._adapters import _parse_teams_webhook as _raw_parse
 
 
 def _parse_teams_webhook_python(payload):

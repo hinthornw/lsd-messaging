@@ -1,4 +1,4 @@
-"""Public data types for the lsmsg SDK."""
+"""Public data types for the botmux SDK."""
 
 from __future__ import annotations
 

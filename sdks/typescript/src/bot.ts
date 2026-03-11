@@ -16,7 +16,7 @@ import type {
 let native: any;
 try {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  native = require('@lsmsg/native');
+  native = require('@botmux/native');
 } catch {
   // Not available — must be set via setNativeModule before creating a Bot.
   native = undefined;
@@ -32,7 +32,7 @@ function assertNativeAvailable(): void {
     return;
   }
   throw new Error(
-    'lsmsg native bindings are unavailable. Install @lsmsg/native or inject a test double with setNativeModule().',
+    'botmux native bindings are unavailable. Install @botmux/native or inject a test double with setNativeModule().',
   );
 }
 
@@ -288,7 +288,7 @@ export class Bot {
 
     router.post(`${base}/slack/events`, slackBodyParser, (req, res) => {
       this.handleSlackWebhook(req, res).catch((err) => {
-        console.error('[lsmsg] Slack webhook error:', err);
+        console.error('[botmux] Slack webhook error:', err);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Internal error' });
         }
@@ -297,7 +297,7 @@ export class Bot {
 
     router.post(`${base}/teams/events`, teamsBodyParser, (req, res) => {
       this.handleTeamsWebhook(req, res).catch((err) => {
-        console.error('[lsmsg] Teams webhook error:', err);
+        console.error('[botmux] Teams webhook error:', err);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Internal error' });
         }
@@ -316,7 +316,7 @@ export class Bot {
     const app = express();
     app.use(this.expressMiddleware());
     app.listen(port, () => {
-      console.log(`[lsmsg] Bot listening on port ${port}`);
+      console.log(`[botmux] Bot listening on port ${port}`);
     });
   }
 
@@ -351,7 +351,7 @@ export class Bot {
     // Platform-specific reply logic. Full implementation requires platform API
     // tokens and HTTP calls. For now, log the reply.
     console.log(
-      `[lsmsg] Reply to ${event.platform.name}/${event.channelId}: ${text}`,
+      `[botmux] Reply to ${event.platform.name}/${event.channelId}: ${text}`,
     );
   }
 
@@ -416,7 +416,7 @@ export class Bot {
       if (registered) {
         promises.push(
           new Promise<void>((resolve) => resolve(registered.callback(event) as any)).catch((err) => {
-            console.error(`[lsmsg] Handler ${id} threw:`, err);
+            console.error(`[botmux] Handler ${id} threw:`, err);
           }),
         );
       }

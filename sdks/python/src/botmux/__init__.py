@@ -1,10 +1,10 @@
-"""lsmsg - Async-first Python SDK for multi-platform messaging bots."""
+"""botmux - Async-first Python SDK for multi-platform messaging bots."""
 
-from lsmsg._adapters import Adapter, Slack, Teams
-from lsmsg._bot import Bot
-from lsmsg._context import Context
-from lsmsg._remote import LangGraph, Remote
-from lsmsg._types import (
+from botmux._adapters import Adapter, Slack, Teams
+from botmux._bot import Bot
+from botmux._context import Context
+from botmux._remote import LangGraph, Remote
+from botmux._types import (
     Event,
     PlatformCapabilities,
     RunChunk,

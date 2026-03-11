@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from lsmsg._types import Event, RunChunk, RunResult, SentMessage
+from botmux._types import Event, RunChunk, RunResult, SentMessage
 
 if TYPE_CHECKING:
-    from lsmsg._adapters import Adapter
-    from lsmsg._bot import Bot
+    from botmux._adapters import Adapter
+    from botmux._bot import Bot
 
 
 class Context:

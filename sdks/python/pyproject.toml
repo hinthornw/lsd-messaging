@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "lsmsg"
+name = "botmux"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,7 +20,7 @@ dev = [
 
 [tool.maturin]
 manifest-path = "../../crates/lsmsg-py/Cargo.toml"
-module-name = "lsmsg._lsmsg_core"
+module-name = "botmux._botmux_core"
 python-source = "src"
 
 [tool.pytest.ini_options]

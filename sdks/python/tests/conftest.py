@@ -1,4 +1,4 @@
-"""Shared test fixtures for lsmsg tests."""
+"""Shared test fixtures for botmux tests."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from typing import Any, Optional
 
 import pytest
 
-from lsmsg._adapters import Slack
-from lsmsg._types import Event, PlatformCapabilities, SentMessage, UserInfo
+from botmux._adapters import Slack
+from botmux._types import Event, PlatformCapabilities, SentMessage, UserInfo
 
 
 class MockAdapter:
@@ -49,7 +49,7 @@ def mock_adapter():
 @pytest.fixture
 def bot():
     """Create a Bot instance with a Slack adapter (pure-Python fallback)."""
-    from lsmsg._bot import Bot
+    from botmux._bot import Bot
 
     return Bot(
         adapters=[

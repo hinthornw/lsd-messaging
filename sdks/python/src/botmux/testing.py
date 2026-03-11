@@ -1,21 +1,21 @@
-"""Testing utilities for lsmsg bots."""
+"""Testing utilities for botmux bots."""
 
 from __future__ import annotations
 
 import json
 from typing import Any, Optional
 
-from lsmsg._bot import Bot
+from botmux._bot import Bot
 
 
 class BotTestClient:
     """A test client that simulates webhook requests to a Bot without real HTTP.
 
-    Requires ``httpx`` (install with ``pip install lsmsg[dev]``).
+    Requires ``httpx`` (install with ``pip install botmux[dev]``).
 
     Example::
 
-        from lsmsg.testing import BotTestClient
+        from botmux.testing import BotTestClient
 
         client = BotTestClient(bot)
         resp = await client.send_slack_mention("hello", user_id="U1", channel_id="C1")

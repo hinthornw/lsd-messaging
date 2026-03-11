@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 
-from lsmsg._adapters import _parse_slack_webhook as _parse_slack_webhook_python
+from botmux._adapters import _parse_slack_webhook as _parse_slack_webhook_python
 
 
 class TestUrlVerification:

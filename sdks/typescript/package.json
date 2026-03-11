@@ -1,7 +1,7 @@
 {
-  "name": "lsmsg",
+  "name": "botmux",
   "version": "0.1.0",
-  "description": "TypeScript SDK for the lsmsg messaging library",
+  "description": "TypeScript SDK for the botmux messaging library",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -10,7 +10,7 @@
     "bench": "vitest bench --run --dir bench --maxWorkers 1"
   },
   "optionalDependencies": {
-    "@lsmsg/native": "file:../../crates/lsmsg-napi"
+    "@botmux/native": "file:../../crates/lsmsg-napi"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

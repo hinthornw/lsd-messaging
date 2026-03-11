@@ -19,9 +19,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from lsmsg._types import Event, SentMessage
+from botmux._types import Event, SentMessage
 
-logger = logging.getLogger("lsmsg")
+logger = logging.getLogger("botmux")
 
 # The dispatch callback type — set by Bot when building routes.
 DispatchFn = Callable[

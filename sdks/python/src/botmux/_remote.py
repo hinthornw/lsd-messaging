@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, runtime_checkable
 
-from lsmsg._types import RunChunk, RunResult
+from botmux._types import RunChunk, RunResult
 
-logger = logging.getLogger("lsmsg")
+logger = logging.getLogger("botmux")
 
 
 @runtime_checkable
